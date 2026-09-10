@@ -418,6 +418,26 @@ class AccountPool:
                     return acct
             return None
 
+    def acquire_by_id(self, account_id: str) -> Optional[Account]:
+        """Acquire one specific idle account.
+
+        Used for cached upstream conversations: a DeepSeek chat session is
+        owned by the credentials that created it, so round-robin selection is
+        unsafe when continuing that session.
+        """
+        if not account_id:
+            return None
+        with self._lock:
+            candidates = self._accounts
+            if not candidates and self._env_fallback is not None:
+                candidates = [self._env_fallback]
+            for acct in candidates:
+                if acct.id == account_id and acct.state == "idle":
+                    acct.state = "busy"
+                    acct.last_used = time.time()
+                    return acct
+            return None
+
     def release(self, acct: Account):
         """Mark account back to idle unless it was already marked as error."""
         with self._lock:

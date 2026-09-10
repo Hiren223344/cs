@@ -4,6 +4,13 @@
 
 ---
 
+## v3.3.3（2026-09-10）：会话隔离与账号绑定修复
+
+- `ChatSession` 现在记录创建上游会话的 `account_id`。续聊优先获取该账号；若账号忙或不可用，则安全地新建会话，绝不将一个账号的 `chat_session_id` / `parent_message_id` 交给另一个账号。
+- 会话缓存只接受显式会话标识：`X-Conversation-Id`、OpenAI 顶层 `user` 或 Anthropic `metadata.user_id`。缓存键还按调用方（API key 的哈希；无鉴权时为客户端 IP）隔离。删除“第一条消息摘要”回退，避免不同用户首句相同而串话。
+
+---
+
 ## v3.0.0 → v3.3.2 变更摘要
 
 ### v3.3.2（2026-09-05）：WebUI 请求趋势图修复（stats 历史采样 AttributeError）
@@ -81,7 +88,7 @@
 
 - **安全**：默认 `HOST=127.0.0.1`；公网 + 默认密码启动时 `SystemExit(2)`；结构化 JSON 日志；`data/accounts.json` 可选 Fernet 加密（启动时透明迁移）；CORS 严格化（空 = 同源）；XFF 白名单 (`TRUSTED_PROXIES`)；安全响应头。
 - **Bug**：`adapter.chat()` 现在返回 `(content, thinking)` 元组；`anthropic_format.build_nonstream_response` 接收 `thinking_text`；`StreamSieve` 改为迭代式排空、`feed("")` 递归被替换为 `while`、捕获缓冲硬上限 1 MB（可配置 `DSML_MAX_BUFFER_BYTES`）；账号错误达到 3 次后自动后台 `check_health` 恢复。
-- **新功能**：`MODEL_ROUTES` 模型路由；`SESSION_CACHE_TTL` 多轮会话（OpenAI `X-Conversation-Id` 头 / Anthropic `metadata.user_id` / 消息摘要 fallback）；`CLIENT_RPM_PER_KEY` / `CLIENT_RPM_PER_IP` 双维度滑动窗口限流；`usage` 字段返回真实 token 数（tiktoken cl100k_base，缺失时字符启发式）；`/admin/api/stats` 增加 p50/p95/p99 + 成功率。
+- **新功能**：`MODEL_ROUTES` 模型路由；`SESSION_CACHE_TTL` 多轮会话（OpenAI `X-Conversation-Id` 头 / Anthropic `metadata.user_id`；历史版本曾使用消息摘要 fallback）；`CLIENT_RPM_PER_KEY` / `CLIENT_RPM_PER_IP` 双维度滑动窗口限流；`usage` 字段返回真实 token 数（tiktoken cl100k_base，缺失时字符启发式）；`/admin/api/stats` 增加 p50/p95/p99 + 成功率。
 - **工程化**：`tests/test_*.py` 56 个 pytest 用例；CI 矩阵 (3.10/3.11/3.12)；SSE 错误帧（OpenAI 流末尾发 `data: {"error":...}` 后 `data: [DONE]`）替代直接抛 500。
 
 ---
@@ -1758,7 +1765,7 @@ class ContentPart(BaseModel):
 | `CLIENT_RPM_PER_KEY` | `60` | 每 key 每分钟请求数(0=不限) | ⭐限流 |
 | `CLIENT_RPM_PER_IP` | `120` | 每 IP 每分钟请求数(0=不限) | ⭐限流 |
 | `ENABLE_RATE_LIMIT` | `true` | 限流总开关 | |
-| `SESSION_CACHE_TTL` | `600` | 多轮会话缓存秒数，0=禁多轮 | ⭐多轮 |
+| `SESSION_CACHE_TTL` | `1800` | 多轮会话缓存秒数，0=禁多轮 | ⭐多轮 |
 | `DEEPSEEK_TOKEN` / `_N` | `""` | DeepSeek 账号凭证(token)，`_1`为多账号 | ⭐兜底账号 |
 | `DEEPSEEK_COOKIES` / `_N` | `""` | DeepSeek 账号 Cookie | ⭐兜底账号 |
 | `DEEPSEEK_EMAIL_N` | `env-N` | 多账号标识 | |

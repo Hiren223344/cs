@@ -57,19 +57,28 @@ def test_chat_session_message_counter():
 
 
 def test_derive_conversation_id_from_user_field():
-    msgs = [{"role": "user", "content": "hi", "user": "alice"}]
-    cid = SessionCache.derive_conversation_id(None, msgs, None)
-    # The helper DOES honor the "user" key in the message dict (it's the
-    # canonical OpenAI field). When the field is present, we get the raw
-    # value as the conversation id.
-    assert cid == "alice"
+    cid = SessionCache.derive_conversation_id("alice", None)
+    assert cid == "user:alice"
 
 
 def test_derive_conversation_id_from_metadata():
-    cid = SessionCache.derive_conversation_id(None, [], {"user_id": "bob"})
-    assert cid == "bob"
+    cid = SessionCache.derive_conversation_id(None, {"user_id": "bob"})
+    assert cid == "user:bob"
 
 
 def test_derive_conversation_id_anon():
-    cid = SessionCache.derive_conversation_id(None, [], None)
-    assert cid == "anon"
+    cid = SessionCache.derive_conversation_id(None, None)
+    assert cid is None
+
+
+def test_identical_message_content_is_not_a_conversation_id():
+    # Two unrelated callers saying "hello" must never be merged simply
+    # because their first message happens to match.
+    assert SessionCache.derive_conversation_id(None, None) is None
+
+
+def test_cache_key_is_scoped_and_opaque():
+    a = SessionCache.derive_cache_key("key:caller-a", "user:alice")
+    b = SessionCache.derive_cache_key("key:caller-b", "user:alice")
+    assert a != b
+    assert "alice" not in a

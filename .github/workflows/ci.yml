@@ -64,6 +64,7 @@ jobs:
                           tests/test_dsml.py \
                           tests/test_token_counter.py \
                           tests/test_session_cache.py \
+                          tests/test_session_binding.py \
                           tests/test_model_router.py \
                           tests/test_rate_limiter.py \
                           tests/test_ip_utils.py \

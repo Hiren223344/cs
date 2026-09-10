@@ -502,10 +502,11 @@ The `StreamSieve` engine switches to "capture" mode upon receiving the first `<`
 The DeepSeek Chat protocol itself supports chaining messages within the same `chat_session_id` via `parent_message_id`. v2.2.0 leverages this for lightweight multi-turn support on the compatible endpoints:
 
 - **Anthropic clients**: use the `metadata.user_id` field in the request body as the session stickiness key.
-- **OpenAI clients**: use the custom HTTP header `X-Conversation-Id` as the session key.
-- **Fallback**: when neither is set, a SHA-256 digest of the first user message is used as the key.
+- **OpenAI clients**: use the custom HTTP header `X-Conversation-Id` or the top-level `user` field as the session key.
+- **Isolation and account binding**: cached sessions are scoped to the caller and bound to the DeepSeek account that created them; an upstream session is never submitted with another account's credentials.
+- **Without an explicit identifier**: sessions are not reused. The proxy never infers a key from the first message, since unrelated users often share the same opener.
 
-The session cache TTL defaults to 600 seconds (`SESSION_CACHE_TTL`); a new session starts automatically after expiry. Set `SESSION_CACHE_TTL=0` to fully disable multi-turn behavior.
+The session cache TTL defaults to 1800 seconds (`SESSION_CACHE_TTL`); a new session starts automatically after expiry. Set `SESSION_CACHE_TTL=0` to fully disable multi-turn behavior.
 
 ```bash
 # OpenAI multi-turn example (with X-Conversation-Id header)
@@ -520,7 +521,7 @@ curl http://localhost:8080/v1/chat/completions \
 # The second message will see the context of the first.
 ```
 
-> **Note**: multi-turn sessions depend on DeepSeek upstream accepting `parent_message_id`; if the upstream has a length limit on history, long sessions may be truncated mid-way. The current `_msg_counters` is session-level monotonically increasing within the adapter, so existing behavior is not broken even on cache misses.
+> **Note**: multi-turn sessions depend on DeepSeek upstream accepting `parent_message_id`; if the upstream has a length limit on history, long sessions may be truncated mid-way. When the original account is busy or unavailable, the proxy safely starts a new session instead of continuing the old one with another account.
 
 ---
 

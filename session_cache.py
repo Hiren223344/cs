@@ -6,17 +6,21 @@ inside a ``chat_session_id``. To support multi-turn conversations on the
 OpenAI / Anthropic compatible endpoints, we cache a small per-conversation
 record and reuse it when a client sends a stable identity token.
 
-Cache key: ``f"{api_key_or_ip}:{conversation_id}"``
+Cache key: a server-generated value scoped to the authenticated caller (or
+client IP when unauthenticated) and an explicit conversation identifier.
 
 ``conversation_id`` resolution order (highest first):
-  1. The OpenAI request's ``user`` field (string).
+  1. The OpenAI request's top-level ``user`` field (string).
   2. The Anthropic request's ``metadata.user_id`` field.
-  3. A SHA-256 of the first user message — works as a "best effort"
-     conversation stickiness even when the client doesn't pass a stable id.
+  3. No cache entry.  Reusing an upstream session without an explicit
+     conversation id can join independent conversations that happen to have
+     the same opening message.
 
-Cache value: ``ChatSession(chat_session_id, parent_message_id, msg_counters)``
+Cache value: ``ChatSession(chat_session_id, account_id, parent_message_id,
+msg_counters)``.  The account binding prevents a session created with one
+DeepSeek account from ever being submitted with another account's credentials.
 
-TTL: configured via ``SESSION_CACHE_TTL`` (default 600 seconds). Expired
+TTL: configured via ``SESSION_CACHE_TTL`` (default 1800 seconds). Expired
 entries are evicted on read; an opportunistic full sweep runs at most
 once every ``SWEEP_INTERVAL`` seconds.
 """
@@ -80,6 +84,9 @@ def delta_prompt(prev: str, cur: str) -> str | None:
 @dataclass
 class ChatSession:
     chat_session_id: str
+    # Upstream session IDs are account-owned.  An empty value represents a
+    # legacy/incomplete in-memory entry and is deliberately never reusable.
+    account_id: str = ""
     parent_message_id: int = 0
     msg_counters: dict[str, int] | None = None
     # The exact full prompt text that was sent for the last turn of this
@@ -111,43 +118,28 @@ class SessionCache:
         self._last_sweep = 0.0
 
     @staticmethod
-    def derive_conversation_id(req_model: str | None, messages: list | None,
-                               metadata: dict | None) -> str:
-        """Pick a stable conversation id from a request payload."""
-        # OpenAI `user` field — already a string identifier
-        if isinstance(req_model, str) and req_model:
-            # We don't use the model as the conversation id; it's a hint.
-            pass
-        if messages:
-            for m in messages:
-                if isinstance(m, dict):
-                    user = m.get("user")
-                    if not user and isinstance(m.get("content"), list):
-                        # Anthropic style
-                        for blk in m["content"]:
-                            if isinstance(blk, dict) and blk.get("type") == "tool_result":
-                                continue
-                    if user and isinstance(user, str):
-                        return user
+    def derive_conversation_id(user_id: str | None, metadata: dict | None) -> str | None:
+        """Return an explicit stable conversation identifier, if supplied.
+
+        Never infer identity from message content: the same first prompt is a
+        common occurrence and must not cause two callers to share upstream
+        context.
+        """
+        if isinstance(user_id, str) and user_id.strip():
+            return f"user:{user_id.strip()}"
         if metadata and isinstance(metadata, dict):
             uid = metadata.get("user_id")
-            if isinstance(uid, str) and uid:
-                return uid
-        # Fallback: hash the first user-role message body. Different
-        # conversations can collide on the same opener, but that's better
-        # than creating a new session for every request.
-        if messages:
-            for m in messages:
-                if isinstance(m, dict) and m.get("role") in ("user", None):
-                    body = m.get("content", "")
-                    if isinstance(body, list):
-                        body = " ".join(
-                            str(b.get("text", "")) for b in body
-                            if isinstance(b, dict)
-                        )
-                    if body:
-                        return "hash:" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-        return "anon"
+            if isinstance(uid, str) and uid.strip():
+                return f"user:{uid.strip()}"
+        return None
+
+    @staticmethod
+    def derive_cache_key(scope: str, conversation_id: str | None) -> str | None:
+        """Create an opaque cache key without retaining caller identifiers."""
+        if not scope or not conversation_id:
+            return None
+        material = f"{scope}\0{conversation_id}".encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
 
     def get(self, key: str) -> Optional[ChatSession]:
         if not self._ttl or not key:

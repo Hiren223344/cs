@@ -505,10 +505,11 @@ DSML 使用类似 XML 的标签结构。当模型决定调用工具时，响应�
 DeepSeek Chat 协议本身支持 `parent_message_id` 串接同 `chat_session_id` 内的消息。v2.2.0 利用此能力为兼容端点提供轻量级多轮支持：
 
 - **Anthropic 客户端**：通过请求体中的 `metadata.user_id` 字段作为会话粘性 key
-- **OpenAI 客户端**：通过自定义 HTTP 头 `X-Conversation-Id` 作为会话 key
-- **Fallback**：当两者都未设置时，对第一条 user 消息做 SHA-256 摘要作为 key
+- **OpenAI 客户端**：通过自定义 HTTP 头 `X-Conversation-Id` 或顶层 `user` 字段作为会话 key
+- **隔离与账号绑定**：缓存同时绑定调用方和创建会话的 DeepSeek 账号；同一上游 session 不会跨账号提交。
+- **无显式标识时**：不复用会话。不会再根据第一条消息推断 key，以避免不同用户因首句相同而串话。
 
-会话缓存默认 TTL 为 600 秒（`SESSION_CACHE_TTL`），过期后自动开始新会话。设置 `SESSION_CACHE_TTL=0` 完全禁用多轮行为。
+会话缓存默认 TTL 为 1800 秒（`SESSION_CACHE_TTL`），过期后自动开始新会话。设置 `SESSION_CACHE_TTL=0` 完全禁用多轮行为。
 
 ```bash
 # OpenAI 多轮示例（带 X-Conversation-Id 头）
@@ -523,7 +524,7 @@ curl http://localhost:8080/v1/chat/completions \
 # 第二条消息会看到第一条的上下文。
 ```
 
-> **注意**：多轮会话依赖 DeepSeek 上游接受 `parent_message_id`；如果上游对历史消息有长度限制，长会话可能中途被截断。当前的 `_msg_counters` 在 adapter 内是会话级单调递增的，所以即使缓存未命中也不会破坏既有行为。
+> **注意**：多轮会话依赖 DeepSeek 上游接受 `parent_message_id`；如果上游对历史消息有长度限制，长会话可能中途被截断。账号繁忙或不可用时，代理会安全地改用新会话，而不是用其他账号继续旧会话。
 
 ---
 

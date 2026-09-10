@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+import hashlib
 from typing import Optional, Union, Any
 
 import uvicorn
@@ -313,6 +314,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     tools: Optional[list[ToolDef]] = None
     tool_choice: Optional[Union[str, dict]] = None
+    # OpenAI's top-level end-user identifier.  It is used only as one part of
+    # an opaque, caller-scoped upstream-session cache key.
+    user: Optional[str] = None
     # Expert mode
     thinking_mode: Optional[bool] = False
     search_enabled: Optional[bool] = False
@@ -344,7 +348,12 @@ class AcquiredAccount:
         self._released = False
         # If we have a cache key, try to reuse the existing session first.
         if cache_key:
-            self._cached_session = SESSION_CACHE.get(cache_key)
+            cached = SESSION_CACHE.get(cache_key)
+            # A DeepSeek session belongs to the credentials that created it.
+            # Reject mismatches (including legacy entries without a binding)
+            # instead of submitting account A's session with account B.
+            if cached is not None and cached.account_id == self.acct.id:
+                self._cached_session = cached
 
     def create_session(self) -> str:
         # Reuse the cached session if we have one — multi-turn support.
@@ -355,7 +364,7 @@ class AcquiredAccount:
         ds_id = self.adapter.create_session()
         self._session_id = ds_id
         if self._cache_key:
-            sess = ChatSession(chat_session_id=ds_id)
+            sess = ChatSession(chat_session_id=ds_id, account_id=self.acct.id)
             SESSION_CACHE.put(self._cache_key, sess)
             # Keep the live reference so record_message_id() can update the
             # parent id in place (the cache stores the same object).
@@ -417,10 +426,15 @@ class AcquiredAccount:
             return
         sess = self._cached_session
         if sess is None:
-            sess = SESSION_CACHE.get(self._cache_key)
+            candidate = SESSION_CACHE.get(self._cache_key)
+            # Do not overwrite another account's live cache entry in a
+            # concurrent fallback path; this turn must establish its own.
+            sess = candidate if candidate and candidate.account_id == self.acct.id else None
         if sess is None:
-            sess = ChatSession(chat_session_id=session_id or "")
+            sess = ChatSession(chat_session_id=session_id or "", account_id=self.acct.id)
             SESSION_CACHE.put(self._cache_key, sess)
+        # Defensive repair for entries constructed by older versions.
+        sess.account_id = self.acct.id
         if session_id:
             sess.chat_session_id = session_id
         sess.parent_message_id = mid
@@ -442,7 +456,13 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
     # requests don't hold accounts busy.
     _UPSTREAM_LIMITER.acquire()
     try:
-        acct = pool.acquire()
+        cached = SESSION_CACHE.get(cache_key) if cache_key else None
+        # Keep a cached conversation on its creating account whenever it is
+        # available.  If it is busy/error, safely start a fresh conversation
+        # on the next idle account rather than crossing credentials.
+        acct = pool.acquire_by_id(cached.account_id) if cached and cached.account_id else None
+        if acct is None:
+            acct = pool.acquire()
     except Exception:
         _UPSTREAM_LIMITER.release()
         raise
@@ -462,30 +482,38 @@ def _upstream_limit_from_env() -> int:
 _UPSTREAM_LIMITER = threading.BoundedSemaphore(_upstream_limit_from_env())
 
 
-def _extract_openai_user(messages: list[ChatMessage], request: Request) -> str:
+def _cache_scope(request: Request) -> str:
+    """Return an opaque caller scope for session-cache isolation."""
+    supplied = _extract_api_key(request)
+    if supplied:
+        digest = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
+        return f"key:{digest}"
+    return f"ip:{_client_ip(request)}"
+
+
+def _cache_key(request: Request, mode: str, conversation_id: str | None) -> str | None:
+    derived = SessionCache.derive_cache_key(_cache_scope(request), conversation_id)
+    return f"{mode}:{derived}" if derived else None
+
+
+def _extract_openai_user(req: ChatCompletionRequest, request: Request) -> str | None:
     """Derive a per-conversation cache key for the OpenAI endpoint.
 
-    Strategy: combine the client IP (when trusted) with the SHA-256 of
-    the first user-role message. The first-message hash is good enough
-    stickiness for short conversations; clients that want a stronger
-    identity should set the OpenAI ``user`` field (we don't model it
-    directly in the request schema yet, so it lives in headers as
-    ``X-Conversation-Id``).
+    Only explicit identifiers are accepted.  Message-content hashing was
+    unsafe because unrelated callers commonly share the same opener.
     """
     cid = request.headers.get("X-Conversation-Id", "").strip()
     if cid:
-        return f"hdr:{cid}"
-    return SessionCache.derive_conversation_id(None, [m.model_dump() for m in messages], None)
+        return f"header:{cid}"
+    return SessionCache.derive_conversation_id(req.user, None)
 
 
-def _extract_anthropic_user(req: AnthropicRequest, request: Request) -> str:
+def _extract_anthropic_user(req: AnthropicRequest, request: Request) -> str | None:
     cid = request.headers.get("X-Conversation-Id", "").strip()
     if cid:
-        return f"hdr:{cid}"
+        return f"header:{cid}"
     metadata = req.metadata or {}
-    return SessionCache.derive_conversation_id(
-        None, [m.model_dump() for m in req.messages], metadata
-    )
+    return SessionCache.derive_conversation_id(None, metadata)
 
 
 # ---- Message / prompt building ----
@@ -681,13 +709,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Session cache keys are mode-scoped: reusing a session created by a
     # streamed call from a non-streaming call (or vice versa) makes the
     # upstream return an empty response. Same-mode multi-turn still works.
-    openai_user = _extract_openai_user(req.messages, request)
+    openai_user = _extract_openai_user(req, request)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
-                                    cache_key=f"stream:{openai_user}")
+                                    cache_key=_cache_key(request, "stream", openai_user))
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
-                             cache_key=f"nonstream:{openai_user}")
+                             cache_key=_cache_key(request, "nonstream", openai_user))
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -755,12 +783,12 @@ async def messages(req: AnthropicRequest, request: Request):
                                        model_type=model_type, thinking_mode=thinking,
                                        search_enabled=search,
                                        rate_headers=rate_headers,
-                                       cache_key=f"stream:{anth_user}")
+                                       cache_key=_cache_key(request, "stream", anth_user))
 
     return _anthropic_nonstream(proxy_id, prompt, tool_names,
                                 model_type=model_type, thinking_mode=thinking,
                                 search_enabled=search,
-                                cache_key=f"nonstream:{anth_user}")
+                                cache_key=_cache_key(request, "nonstream", anth_user))
 
 
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
