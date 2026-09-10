@@ -22,7 +22,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          notes="docs/release-notes/${TAG#v}.md"
+          notes="docs/release-notes/${TAG}.md"
           if [ -f "$notes" ]; then
             gh release create "$TAG" \
               --title "$TAG" \
