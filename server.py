@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from upstream_adapter import OpenAIUpstreamAdapter
+
 from adapter import (
     DeepSeekAdapter,
     UpstreamEmptyError,
@@ -136,6 +138,34 @@ ALLOW_INSECURE_PUBLIC_DEFAULTS = os.environ.get("ALLOW_INSECURE_PUBLIC_DEFAULTS"
 # CORS allow-list. Empty = same-origin only.
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 ALLOW_CREDENTIALS = bool(ALLOWED_ORIGINS) and os.environ.get("ALLOW_CORS_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# External OpenAI-compatible Upstream Configuration
+UPSTREAM_API_URL = os.environ.get("UPSTREAM_API_URL", "").strip()
+UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "").strip()
+UPSTREAM_MODEL = os.environ.get("UPSTREAM_MODEL", "deepseek-chat").strip()
+UPSTREAM_MODE = os.environ.get("UPSTREAM_MODE", "api" if UPSTREAM_API_URL else "pool").strip().lower()
+
+
+class ApiAccount:
+    """Mock account wrapping an OpenAI-compatible upstream adapter."""
+    def __init__(self, base_url: str, api_key: str = "", model: str = "deepseek-chat"):
+        self.id = "upstream_api"
+        self.email = "upstream_api"
+        self.is_api = True
+        self.state = "idle"
+        self.adapter = OpenAIUpstreamAdapter(base_url=base_url, api_key=api_key, model=model)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "email": self.email,
+            "source": "upstream_api",
+            "state": self.state,
+            "read_only": True,
+        }
+
+
+UPSTREAM_API_ACCT = ApiAccount(UPSTREAM_API_URL, UPSTREAM_API_KEY, UPSTREAM_MODEL) if UPSTREAM_API_URL else None
 
 
 def _load_api_keys() -> list[str]:
@@ -466,18 +496,10 @@ class AcquiredAccount:
         return ds_id
 
     def prepare_prompt(self, full_prompt: str) -> str:
-        """Return the prompt to send upstream.
+        """Return the prompt to send upstream."""
+        if getattr(self.acct, "is_api", False):
+            return full_prompt
 
-        On a reused cached session this may be an incremental *tail* (only
-        the new user turn) via ``delta_prompt`` — the parent chain keeps the
-        context server-side. Resending the full history on every turn would
-        make the DeepSeek conversation embed previous turns repeatedly
-        (quadratic growth, bot-spam signature).
-
-        Call *before* ``create_session()``: when the history diverges from
-        what was previously sent, the cached session is invalidated so the
-        next ``create_session()`` starts a fresh chain.
-        """
         cached = self._cached_session
         if self._cache_key and cached is not None and cached.sent_prompt:
             prev = cached.sent_prompt
@@ -508,26 +530,15 @@ class AcquiredAccount:
 
     def record_message_id(self, mid: int, session_id: str | None = None,
                           full_prompt: str = "") -> None:
-        """After a successful turn, record the upstream response message id
-        (and the session that actually answered) into the cache so the next
-        turn sends the correct ``parent_message_id``.
-
-        Fixes the v3.2.2 leftover: previously never called, so a reused
-        cached session sent ``parent_message_id=0`` on the second turn and
-        the upstream replied with an empty body.
-        """
         if not self._cache_key:
             return
         sess = self._cached_session
         if sess is None:
             candidate = SESSION_CACHE.get(self._cache_key)
-            # Do not overwrite another account's live cache entry in a
-            # concurrent fallback path; this turn must establish its own.
             sess = candidate if candidate and candidate.account_id == self.acct.id else None
         if sess is None:
             sess = ChatSession(chat_session_id=session_id or "", account_id=self.acct.id)
             SESSION_CACHE.put(self._cache_key, sess)
-        # Defensive repair for entries constructed by older versions.
         sess.account_id = self.acct.id
         if session_id:
             sess.chat_session_id = session_id
@@ -540,7 +551,8 @@ class AcquiredAccount:
         if self._released:
             return
         self._released = True
-        pool.release(self.acct)
+        if not getattr(self.acct, "is_api", False):
+            pool.release(self.acct)
         _UPSTREAM_LIMITER.release()
 
 
@@ -550,17 +562,25 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
     # requests don't hold accounts busy.
     _UPSTREAM_LIMITER.acquire()
     try:
+        if UPSTREAM_API_URL and UPSTREAM_MODE == "api" and UPSTREAM_API_ACCT is not None:
+            return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+
         cached = SESSION_CACHE.get(cache_key) if cache_key else None
-        # Keep a cached conversation on its creating account whenever it is
-        # available.  If it is busy/error, safely start a fresh conversation
-        # on the next idle account rather than crossing credentials.
         acct = pool.acquire_by_id(cached.account_id) if cached and cached.account_id else None
         if acct is None:
-            acct = pool.acquire()
+            try:
+                acct = pool.acquire()
+            except Exception:
+                if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+                    log.info("pool_busy_fallback_to_upstream_api")
+                    return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+                raise
     except Exception:
         _UPSTREAM_LIMITER.release()
         raise
     if acct is None:
+        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+            return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
         _UPSTREAM_LIMITER.release()
         raise HTTPException(status_code=503, detail="All accounts busy, try again later")
     return AcquiredAccount(acct, cache_key=cache_key)
@@ -942,7 +962,23 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         finally:
             acq.release()
     else:
-        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
+        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+            log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
+            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            try:
+                eff = acq.prepare_prompt(prompt)
+                ds_id = acq.create_session()
+                t0 = time.time()
+                ready_out = {}
+                content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                      parent_message_id=acq.parent_message_id,
+                                                      ready_out=ready_out)
+                get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+            finally:
+                acq.release()
+        else:
+            raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
 
     content = _sanitize_brand(content)
     if thinking:
@@ -999,7 +1035,22 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                 acq = None
             raise
     else:
-        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
+        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+            log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
+            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            eff = acq.prepare_prompt(prompt)
+            ds_id = acq.create_session()
+            stream_gen = acq.adapter.chat_stream(
+                ds_id, eff,
+                model_type=model_type,
+                thinking_enabled=thinking_mode,
+                search_enabled=search_enabled,
+                parent_message_id=acq.parent_message_id,
+                ready_out=ready_out
+            )
+            first_token = next(stream_gen, None)
+        else:
+            raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
 
     t0 = time.time()
 
@@ -1110,7 +1161,23 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         finally:
             acq.release()
     else:
-        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
+        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+            log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
+            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            try:
+                eff = acq.prepare_prompt(prompt)
+                ds_id = acq.create_session()
+                t0 = time.time()
+                ready_out = {}
+                content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                      parent_message_id=acq.parent_message_id,
+                                                      ready_out=ready_out)
+                get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+            finally:
+                acq.release()
+        else:
+            raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
 
     content = _sanitize_brand(content)
     if thinking:
@@ -1208,7 +1275,22 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 acq = None
             raise
     else:
-        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
+        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+            log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
+            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            eff = acq.prepare_prompt(prompt)
+            ds_id = acq.create_session()
+            stream_iter = acq.adapter.chat_stream(
+                ds_id, eff,
+                model_type=model_type,
+                thinking_enabled=thinking_mode,
+                search_enabled=search_enabled,
+                parent_message_id=acq.parent_message_id,
+                ready_out=ready_out
+            )
+            first_token = next(stream_iter, None)
+        else:
+            raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
 
     tool_names = _get_tool_names(tools)
     t0 = time.time()

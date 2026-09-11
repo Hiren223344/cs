@@ -61,6 +61,12 @@ MODEL_ROUTES={{"gpt-6-astra":"default","gpt-6-astra-reasoner":"expert","cs":"def
 MODEL_NAME=gpt-6-astra
 MODEL_OWNER=openai
 
+# Upstream OpenAI-compatible API
+UPSTREAM_API_URL=http://43.153.6.116:8000/v1
+UPSTREAM_API_KEY=
+UPSTREAM_MODEL=deepseek-chat
+UPSTREAM_MODE=api
+
 # Network Bind & Port
 HOST=0.0.0.0
 PORT=8000
