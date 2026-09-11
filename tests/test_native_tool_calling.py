@@ -159,3 +159,65 @@ def test_build_nonstream_response_tool_calls():
     assert blocks[2]["id"] == "toolu_999"
     assert blocks[2]["name"] == "test_tool"
     assert blocks[2]["input"] == {"a": 1}
+
+
+def test_api_account_error_safe():
+    from server import ApiAccount, _mark_error_safe
+    from account_pool import AccountPool
+    import tempfile
+    from pathlib import Path
+
+    api_acct = ApiAccount("https://api.orcarouter.ai/v1", "sk-test", "deepseek-chat")
+    assert hasattr(api_acct, "error_count")
+    assert hasattr(api_acct, "last_error")
+
+    pool = AccountPool()
+    # Ensure neither release nor mark_error throw AttributeError on ApiAccount
+    pool.release(api_acct)
+    pool.mark_error(api_acct, "Rate limit test error")
+    _mark_error_safe(api_acct, "Safe error")
+
+
+def test_upstream_adapter_orcarouter_model_mapping(monkeypatch):
+    from upstream_adapter import OpenAIUpstreamAdapter
+
+    adapter = OpenAIUpstreamAdapter("https://api.orcarouter.ai/v1", "sk-test", "orcarouter/free")
+
+    sent_payload = None
+
+    class MockResp:
+        status_code = 200
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+        def raise_for_status(self):
+            pass
+
+    def mock_post(url, json=None, headers=None):
+        nonlocal sent_payload
+        sent_payload = json
+        return MockResp()
+
+    monkeypatch.setattr(adapter._client, "post", mock_post)
+    content, _ = adapter.chat("sess_1", "hi")
+    assert sent_payload["model"] == "deepseek/deepseek-v4-flash-free"
+    assert content == "ok"
+
+
+def test_upstream_adapter_rate_limit_error(monkeypatch):
+    import httpx
+    from upstream_adapter import OpenAIUpstreamAdapter
+    from adapter import RateLimitError
+
+    adapter = OpenAIUpstreamAdapter("https://api.orcarouter.ai/v1", "sk-test", "orcarouter/free")
+
+    req = httpx.Request("POST", "https://api.orcarouter.ai/v1/chat/completions")
+    err_resp = httpx.Response(429, request=req, text='{"error": {"code": "free_rate_limited"}}')
+
+    def mock_post(url, json=None, headers=None):
+        return err_resp
+
+    monkeypatch.setattr(adapter._client, "post", mock_post)
+    with pytest.raises(RateLimitError) as exc_info:
+        adapter.chat("sess_1", "hi")
+    assert "429" in str(exc_info.value)
+

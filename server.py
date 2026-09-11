@@ -155,6 +155,8 @@ class ApiAccount:
         self.email = "upstream_api"
         self.is_api = True
         self.state = "idle"
+        self.error_count = 0
+        self.last_error = ""
         self.adapter = OpenAIUpstreamAdapter(base_url=base_url, api_key=api_key, model=model)
 
     def to_dict(self):
@@ -165,6 +167,14 @@ class ApiAccount:
             "state": self.state,
             "read_only": True,
         }
+
+
+def _mark_error_safe(acct: Any, error_msg: str = "") -> None:
+    if acct is not None and not getattr(acct, "is_api", False):
+        try:
+            pool.mark_error(acct, error_msg)
+        except Exception:
+            pass
 
 
 UPSTREAM_API_ACCT = ApiAccount(UPSTREAM_API_URL, UPSTREAM_API_KEY, UPSTREAM_MODEL) if UPSTREAM_API_URL else None
@@ -558,7 +568,7 @@ class AcquiredAccount:
         _UPSTREAM_LIMITER.release()
 
 
-def _acquire(cache_key: str | None = None) -> AcquiredAccount:
+def _acquire(cache_key: str | None = None, allow_api: bool = True) -> AcquiredAccount:
     # Global upstream concurrency cap (e.g. coding agents spawning parallel
     # sub-agents). Wait for a slot before grabbing a pool account so queued
     # requests don't hold accounts busy.
@@ -570,7 +580,7 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
             if acct is not None:
                 return AcquiredAccount(acct, cache_key=cache_key)
 
-        if UPSTREAM_API_URL and UPSTREAM_MODE == "api" and UPSTREAM_API_ACCT is not None:
+        if allow_api and UPSTREAM_API_URL and UPSTREAM_MODE == "api" and UPSTREAM_API_ACCT is not None:
             return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
 
         acct = pool.acquire_by_id(cached.account_id) if cached and cached.account_id else None
@@ -578,7 +588,7 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
             try:
                 acct = pool.acquire()
             except Exception:
-                if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+                if allow_api and UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
                     log.info("pool_busy_fallback_to_upstream_api")
                     return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
                 raise
@@ -586,7 +596,7 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
         _UPSTREAM_LIMITER.release()
         raise
     if acct is None:
-        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+        if allow_api and UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
             return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
         _UPSTREAM_LIMITER.release()
         raise HTTPException(status_code=503, detail="All accounts busy, try again later")
@@ -973,7 +983,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             break
         except UserMutedError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
             log.warning("anthropic_nonstream_muted_failover", extra={"attempt": attempt})
@@ -988,7 +998,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             )
         except UpstreamHintError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             raise HTTPException(status_code=502, detail=_sanitize_error_message(str(e)))
         except UpstreamEmptyError:
             get_stats().record(MODEL_NAME, 0, success=False)
@@ -997,7 +1007,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             raise HTTPException(status_code=502, detail="Upstream returned empty response, please retry")
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             raise
         finally:
             acq.release()
@@ -1086,17 +1096,28 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             break
         except UserMutedError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
             acq.release()
             acq = None
             log.warning("anthropic_stream_muted_failover", extra={"attempt": attempt})
             continue
+        except RateLimitError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            if acq:
+                acq.release()
+                acq = None
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit reached on upstream capacity. Please retry shortly.",
+            )
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             if acq:
-                pool.mark_error(acq.acct, str(e))
+                _mark_error_safe(acq.acct, str(e))
                 acq.release()
                 acq = None
             raise
@@ -1156,14 +1177,14 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
         except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
             if isinstance(e, UserMutedError):
-                pool.mark_error(acq.acct, str(e))
+                _mark_error_safe(acq.acct, str(e))
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
             elif isinstance(e, (RateLimitError, UpstreamEmptyError)):
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
             else:
-                pool.mark_error(acq.acct, str(e))
+                _mark_error_safe(acq.acct, str(e))
             raise
         finally:
             acq.release()
@@ -1226,7 +1247,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             break
         except UserMutedError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
             log.warning("openai_nonstream_muted_failover", extra={"attempt": attempt})
@@ -1238,7 +1259,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             raise HTTPException(status_code=429, detail="Rate limit reached on upstream capacity. Please retry shortly.")
         except UpstreamHintError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             raise HTTPException(status_code=502, detail=_sanitize_error_message(str(e)))
         except UpstreamEmptyError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
@@ -1247,7 +1268,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             raise HTTPException(status_code=502, detail="Upstream returned empty response, please retry")
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             raise
         finally:
             acq.release()
@@ -1401,17 +1422,28 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             break
         except UserMutedError as e:
             get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
-            pool.mark_error(acq.acct, str(e))
+            _mark_error_safe(acq.acct, str(e))
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
             acq.release()
             acq = None
             log.warning("openai_stream_muted_failover", extra={"attempt": attempt})
             continue
+        except RateLimitError as e:
+            get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            if acq:
+                acq.release()
+                acq = None
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit reached on upstream capacity. Please retry shortly.",
+            )
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
             if acq:
-                pool.mark_error(acq.acct, str(e))
+                _mark_error_safe(acq.acct, str(e))
                 acq.release()
                 acq = None
             raise
@@ -1596,7 +1628,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False,
                                prompt_tokens=prompt_tokens)
             if isinstance(e, UserMutedError):
-                pool.mark_error(acq.acct, str(e))
+                _mark_error_safe(acq.acct, str(e))
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
                 err_msg = "Upstream capacity temporarily exhausted. Please retry shortly."
@@ -1605,7 +1637,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                     SESSION_CACHE.invalidate(cache_key)
                 err_msg = _sanitize_error_message(str(e)[:500])
             else:
-                pool.mark_error(acq.acct, str(e))
+                _mark_error_safe(acq.acct, str(e))
                 err_msg = _sanitize_error_message(str(e)[:500])
             log.exception("openai_stream_failed")
             err = {

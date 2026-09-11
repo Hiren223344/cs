@@ -14,6 +14,7 @@ import secrets
 from typing import Generator, Tuple, Optional, Any
 import httpx
 from logger import get_logger
+from adapter import RateLimitError
 
 log = get_logger("upstream_adapter")
 
@@ -114,7 +115,7 @@ class OpenAIUpstreamAdapter:
         target_url = f"{self.base_url}/chat/completions" if not self.base_url.endswith("/chat/completions") else self.base_url
 
         req_model = self.model
-        if tools and req_model == "orcarouter/free":
+        if req_model == "orcarouter/free":
             req_model = "deepseek/deepseek-v4-flash-free"
 
         payload = {
@@ -128,11 +129,19 @@ class OpenAIUpstreamAdapter:
             payload["tool_choice"] = tool_choice
 
         resp = self._client.post(target_url, json=payload, headers=self._headers())
-        if resp.status_code == 402 and req_model == "orcarouter/free":
+        if resp.status_code in (402, 429) and req_model == "orcarouter/free":
             log.warning("orcarouter_free_quota_fallback", extra={"fallback_model": "deepseek/deepseek-v4-flash-free"})
             payload["model"] = "deepseek/deepseek-v4-flash-free"
             resp = self._client.post(target_url, json=payload, headers=self._headers())
-        resp.raise_for_status()
+
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            err_body = resp.text
+            log.error("upstream_http_error", extra={"status": resp.status_code, "body": err_body})
+            if resp.status_code in (429, 402):
+                raise RateLimitError(f"Upstream rate limit ({resp.status_code}): {err_body}") from e
+            raise RuntimeError(f"Upstream HTTP {resp.status_code}: {err_body}") from e
         data = resp.json()
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
@@ -162,7 +171,7 @@ class OpenAIUpstreamAdapter:
         target_url = f"{self.base_url}/chat/completions" if not self.base_url.endswith("/chat/completions") else self.base_url
 
         req_model = self.model
-        if tools and req_model == "orcarouter/free":
+        if req_model == "orcarouter/free":
             req_model = "deepseek/deepseek-v4-flash-free"
 
         payload = {
@@ -182,13 +191,21 @@ class OpenAIUpstreamAdapter:
         stream_ctx = self._client.stream("POST", target_url, json=payload, headers=self._headers())
         resp = stream_ctx.__enter__()
         try:
-            if resp.status_code == 402 and req_model == "orcarouter/free":
+            if resp.status_code in (402, 429) and req_model == "orcarouter/free":
                 stream_ctx.__exit__(None, None, None)
                 log.warning("orcarouter_free_quota_fallback", extra={"fallback_model": "deepseek/deepseek-v4-flash-free"})
                 payload["model"] = "deepseek/deepseek-v4-flash-free"
                 stream_ctx = self._client.stream("POST", target_url, json=payload, headers=self._headers())
                 resp = stream_ctx.__enter__()
-            resp.raise_for_status()
+
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                err_body = resp.read().decode(errors="replace")
+                log.error("upstream_stream_http_error", extra={"status": resp.status_code, "body": err_body})
+                if resp.status_code in (429, 402):
+                    raise RateLimitError(f"Upstream rate limit ({resp.status_code}): {err_body}") from e
+                raise RuntimeError(f"Upstream HTTP {resp.status_code}: {err_body}") from e
             for line in resp.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue

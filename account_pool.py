@@ -440,6 +440,8 @@ class AccountPool:
 
     def release(self, acct: Account):
         """Mark account back to idle unless it was already marked as error."""
+        if getattr(acct, "is_api", False) or not hasattr(acct, "state"):
+            return
         with self._lock:
             if acct.state == "busy":
                 acct.state = "idle"
@@ -450,6 +452,8 @@ class AccountPool:
         (e.g. WAF challenge window expired, IP block lifted). The threshold
         is intentionally low so that transient blips heal automatically.
         """
+        if getattr(acct, "is_api", False) or not hasattr(acct, "error_count"):
+            return
         with self._lock:
             acct.state = "error"
             acct.error_count += 1
