@@ -67,6 +67,11 @@ UPSTREAM_API_KEY=sk-orca-0q7CaCdx8Eddhag4ixw1tyfnc6k3FwTgE9LuS2zKa9H
 UPSTREAM_MODEL=orcarouter/free
 UPSTREAM_MODE=api
 
+# Fallback API Provider
+FALLBACK_API_URL=https://api.apinex.bond/v1
+FALLBACK_API_KEY=sk-apx1fb620e3fd93bb3af2557b37fbfe51805fa5017880b0b48
+FALLBACK_MODEL=free/muse-spark-1.3
+
 # Network Bind & Port
 HOST=0.0.0.0
 PORT=8000

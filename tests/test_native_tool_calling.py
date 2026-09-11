@@ -221,3 +221,111 @@ def test_upstream_adapter_rate_limit_error(monkeypatch):
         adapter.chat("sess_1", "hi")
     assert "429" in str(exc_info.value)
 
+
+def test_primary_to_fallback_api_failover():
+    import server
+    assert server.FALLBACK_API_ACCT is not None
+    assert server.FALLBACK_API_ACCT.id == "fallback_api"
+    assert server.FALLBACK_API_ACCT.adapter.model == "free/muse-spark-1.3"
+
+    acq0 = server._acquire(attempt=0)
+    try:
+        assert acq0.acct.id == "upstream_api"
+    finally:
+        acq0.release()
+
+    acq1 = server._acquire(attempt=1)
+    try:
+        assert acq1.acct.id == "fallback_api"
+    finally:
+        acq1.release()
+
+
+@pytest.mark.anyio
+async def test_streaming_failover_on_ratelimit(monkeypatch):
+    import server
+    from adapter import RateLimitError
+
+    call_count = 0
+
+    class MockAcct:
+        is_api = True
+        id = "mock_api"
+
+    class MockAcq:
+        parent_message_id = None
+        def __init__(self, acct_id):
+            self.acct = MockAcct()
+            self.acct.id = acct_id
+            self.adapter = self
+        def create_session(self):
+            return "sess_123"
+        def release(self):
+            pass
+        def chat_stream(self, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if self.acct.id == "primary":
+                raise RateLimitError("429 rate limited")
+            yield "Hello from fallback"
+
+    def mock_acquire_safe(cache_key=None, attempt=0):
+        if attempt == 0:
+            return MockAcq("primary")
+        return MockAcq("fallback")
+
+    monkeypatch.setattr(server, "_acquire_safe", mock_acquire_safe)
+    monkeypatch.setattr(server, "FALLBACK_API_ACCT", MockAcct())
+
+    stream = await server._handle_stream("id_123", "hi")
+    assert call_count == 2
+    chunks = [c async for c in stream.body_iterator]
+    assert any("Hello from fallback" in c for c in chunks)
+
+
+def test_nonstreaming_failover_on_ratelimit(monkeypatch):
+    import server
+    from adapter import RateLimitError
+
+    call_count = 0
+
+    class MockAcct:
+        is_api = True
+        id = "mock_api"
+
+    class MockAcq:
+        parent_message_id = None
+        def __init__(self, acct_id):
+            self.acct = MockAcct()
+            self.acct.id = acct_id
+            self.adapter = self
+        def create_session(self):
+            return "sess_123"
+        def release(self):
+            pass
+        def prepare_prompt(self, p):
+            return p
+        def record_message_id(self, *args, **kwargs):
+            pass
+        def chat(self, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if self.acct.id == "primary":
+                raise RateLimitError("429 rate limited")
+            return "Hello from fallback", None
+
+    def mock_acquire_safe(cache_key=None, attempt=0):
+        if attempt == 0:
+            return MockAcq("primary")
+        return MockAcq("fallback")
+
+    monkeypatch.setattr(server, "_acquire_safe", mock_acquire_safe)
+    monkeypatch.setattr(server, "FALLBACK_API_ACCT", MockAcct())
+
+    resp = server._handle_nonstream("id_123", "hi")
+    assert call_count == 2
+    assert "Hello from fallback" in resp["choices"][0]["message"]["content"]
+
+
+
+

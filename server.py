@@ -147,12 +147,16 @@ UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "sk-orca-0q7CaCdx8Eddhag4i
 UPSTREAM_MODEL = os.environ.get("UPSTREAM_MODEL", "orcarouter/free").strip()
 UPSTREAM_MODE = os.environ.get("UPSTREAM_MODE", "api" if UPSTREAM_API_URL else "pool").strip().lower()
 
+FALLBACK_API_URL = os.environ.get("FALLBACK_API_URL", "https://api.apinex.bond/v1").strip()
+FALLBACK_API_KEY = os.environ.get("FALLBACK_API_KEY", "sk-apx1fb620e3fd93bb3af2557b37fbfe51805fa5017880b0b48").strip()
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "free/muse-spark-1.3").strip()
+
 
 class ApiAccount:
     """Mock account wrapping an OpenAI-compatible upstream adapter."""
-    def __init__(self, base_url: str, api_key: str = "", model: str = "deepseek-chat"):
-        self.id = "upstream_api"
-        self.email = "upstream_api"
+    def __init__(self, base_url: str, api_key: str = "", model: str = "deepseek-chat", acct_id: str = "upstream_api"):
+        self.id = acct_id
+        self.email = acct_id
         self.is_api = True
         self.state = "idle"
         self.error_count = 0
@@ -163,7 +167,7 @@ class ApiAccount:
         return {
             "id": self.id,
             "email": self.email,
-            "source": "upstream_api",
+            "source": self.id,
             "state": self.state,
             "read_only": True,
         }
@@ -177,7 +181,8 @@ def _mark_error_safe(acct: Any, error_msg: str = "") -> None:
             pass
 
 
-UPSTREAM_API_ACCT = ApiAccount(UPSTREAM_API_URL, UPSTREAM_API_KEY, UPSTREAM_MODEL) if UPSTREAM_API_URL else None
+UPSTREAM_API_ACCT = ApiAccount(UPSTREAM_API_URL, UPSTREAM_API_KEY, UPSTREAM_MODEL, acct_id="upstream_api") if UPSTREAM_API_URL else None
+FALLBACK_API_ACCT = ApiAccount(FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL, acct_id="fallback_api") if FALLBACK_API_URL else None
 
 
 def _load_api_keys() -> list[str]:
@@ -568,39 +573,62 @@ class AcquiredAccount:
         _UPSTREAM_LIMITER.release()
 
 
-def _acquire(cache_key: str | None = None, allow_api: bool = True) -> AcquiredAccount:
+def _acquire(cache_key: str | None = None, attempt: int = 0, allow_api: bool = True) -> AcquiredAccount:
     # Global upstream concurrency cap (e.g. coding agents spawning parallel
     # sub-agents). Wait for a slot before grabbing a pool account so queued
     # requests don't hold accounts busy.
     _UPSTREAM_LIMITER.acquire()
     try:
-        cached = SESSION_CACHE.get(cache_key) if cache_key else None
-        if cached and cached.account_id and cached.account_id != "upstream_api":
-            acct = pool.acquire_by_id(cached.account_id)
-            if acct is not None:
-                return AcquiredAccount(acct, cache_key=cache_key)
+        cached = SESSION_CACHE.get(cache_key) if cache_key and attempt == 0 else None
+        if cached and cached.account_id:
+            if cached.account_id == "upstream_api" and UPSTREAM_API_ACCT is not None and attempt == 0:
+                return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            if cached.account_id == "fallback_api" and FALLBACK_API_ACCT is not None:
+                return AcquiredAccount(FALLBACK_API_ACCT, cache_key=cache_key)
+            if cached.account_id not in ("upstream_api", "fallback_api"):
+                acct = pool.acquire_by_id(cached.account_id)
+                if acct is not None:
+                    return AcquiredAccount(acct, cache_key=cache_key)
 
-        if allow_api and UPSTREAM_API_URL and UPSTREAM_MODE == "api" and UPSTREAM_API_ACCT is not None:
-            return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+        if allow_api and UPSTREAM_MODE == "api":
+            if attempt == 0 and UPSTREAM_API_ACCT is not None:
+                return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            if attempt == 1 and FALLBACK_API_ACCT is not None:
+                log.info("primary_api_failed_trying_fallback_api")
+                return AcquiredAccount(FALLBACK_API_ACCT, cache_key=cache_key)
 
         acct = pool.acquire_by_id(cached.account_id) if cached and cached.account_id else None
         if acct is None:
             try:
                 acct = pool.acquire()
             except Exception:
-                if allow_api and UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
-                    log.info("pool_busy_fallback_to_upstream_api")
-                    return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+                if allow_api:
+                    if attempt == 0 and UPSTREAM_API_ACCT is not None:
+                        log.info("pool_busy_fallback_to_upstream_api")
+                        return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+                    if FALLBACK_API_ACCT is not None:
+                        log.info("pool_busy_fallback_to_fallback_api")
+                        return AcquiredAccount(FALLBACK_API_ACCT, cache_key=cache_key)
                 raise
     except Exception:
         _UPSTREAM_LIMITER.release()
         raise
     if acct is None:
-        if allow_api and UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
-            return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+        if allow_api:
+            if attempt == 0 and UPSTREAM_API_ACCT is not None:
+                return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            if FALLBACK_API_ACCT is not None:
+                return AcquiredAccount(FALLBACK_API_ACCT, cache_key=cache_key)
         _UPSTREAM_LIMITER.release()
         raise HTTPException(status_code=503, detail="All accounts busy, try again later")
     return AcquiredAccount(acct, cache_key=cache_key)
+
+
+def _acquire_safe(cache_key: str | None = None, attempt: int = 0) -> AcquiredAccount:
+    try:
+        return _acquire(cache_key=cache_key, attempt=attempt)
+    except TypeError:
+        return _acquire(cache_key=cache_key)
 
 
 def _upstream_limit_from_env() -> int:
@@ -953,11 +981,11 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          cache_key: str | None = None,
                          api_messages: list[dict] | None = None,
                          api_tools: list[dict] | None = None):
-    max_tries = max(1, pool.count())
+    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
     content = ""
     thinking = None
     for attempt in range(max_tries):
-        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
             t0 = time.time()
@@ -992,6 +1020,10 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("anthropic_nonstream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise HTTPException(
                 status_code=429,
                 detail="Rate limit reached on upstream capacity. Please retry shortly.",
@@ -999,18 +1031,31 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         except UpstreamHintError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("anthropic_nonstream_hint_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise HTTPException(status_code=502, detail=_sanitize_error_message(str(e)))
         except UpstreamEmptyError:
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("anthropic_nonstream_empty_failover", extra={"attempt": attempt})
+                continue
             raise HTTPException(status_code=502, detail="Upstream returned empty response, please retry")
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("anthropic_nonstream_error_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise
         finally:
-            acq.release()
+            if acq:
+                acq.release()
     else:
         if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
@@ -1061,16 +1106,17 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             cache_key: str | None = None,
                             api_messages: list[dict] | None = None,
                             api_tools: list[dict] | None = None):
-    max_tries = max(1, pool.count())
+    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
     acq = None
     stream_gen = None
     ready_out: dict = {}
     first_token = None
 
     for attempt in range(max_tries):
-        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
+            ready_out = {}
             if getattr(acq.acct, "is_api", False):
                 stream_gen = acq.adapter.chat_stream(
                     ds_id, "",
@@ -1107,19 +1153,29 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
+            is_api = getattr(getattr(acq, "acct", None), "is_api", False)
             if acq:
                 acq.release()
                 acq = None
+            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("anthropic_stream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise HTTPException(
                 status_code=429,
                 detail="Rate limit reached on upstream capacity. Please retry shortly.",
             )
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
+            is_api = getattr(getattr(acq, "acct", None), "is_api", False)
             if acq:
                 _mark_error_safe(acq.acct, str(e))
                 acq.release()
                 acq = None
+            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("anthropic_stream_error_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise
     else:
         if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
@@ -1213,12 +1269,12 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
                       tool_choice: Any = None):
     """Non-streaming completion with tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
-    max_tries = max(1, pool.count())
+    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
     content = ""
     thinking = None
     ready_out: dict = {}
     for attempt in range(max_tries):
-        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
             t0 = time.time()
@@ -1256,22 +1312,39 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("openai_nonstream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise HTTPException(status_code=429, detail="Rate limit reached on upstream capacity. Please retry shortly.")
         except UpstreamHintError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("openai_nonstream_hint_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise HTTPException(status_code=502, detail=_sanitize_error_message(str(e)))
         except UpstreamEmptyError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("openai_nonstream_empty_failover", extra={"attempt": attempt})
+                continue
             raise HTTPException(status_code=502, detail="Upstream returned empty response, please retry")
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("openai_nonstream_error_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise
         finally:
-            acq.release()
+            if acq:
+                acq.release()
     else:
         if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
@@ -1386,16 +1459,17 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          tool_choice: Any = None):
     """Streaming completion with StreamSieve tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
-    max_tries = max(1, pool.count())
+    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
     acq = None
     stream_iter = None
     ready_out: dict = {}
     first_token = None
 
     for attempt in range(max_tries):
-        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
+            ready_out = {}
             if getattr(acq.acct, "is_api", False):
                 stream_iter = acq.adapter.chat_stream(
                     ds_id, "",
@@ -1433,19 +1507,29 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
+            is_api = getattr(getattr(acq, "acct", None), "is_api", False)
             if acq:
                 acq.release()
                 acq = None
+            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("openai_stream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise HTTPException(
                 status_code=429,
                 detail="Rate limit reached on upstream capacity. Please retry shortly.",
             )
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
+            is_api = getattr(getattr(acq, "acct", None), "is_api", False)
             if acq:
                 _mark_error_safe(acq.acct, str(e))
                 acq.release()
                 acq = None
+            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            if can_retry:
+                log.warning("openai_stream_error_failover", extra={"attempt": attempt, "error": str(e)})
+                continue
             raise
     else:
         if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
