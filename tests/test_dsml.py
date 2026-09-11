@@ -144,3 +144,22 @@ def test_parse_dsml_tool_calls_handles_cdata_escapes():
     # just verify it doesn't crash and returns the raw bytes.
     args = tcs[0]["function"]["arguments"]
     assert "a]]>b" in args
+
+
+def test_parse_dsml_fullwidth_unicode_pipes():
+    raw = (
+        "I'll take a look.\n\n"
+        "<｜｜DSML｜｜ calls>\n"
+        '<｜｜DSML｜｜ invoke name="Bash">\n'
+        '<｜｜DSML｜｜ parameter name="command" string="true">ls -la "C:/Users/Admin/Videos"</｜｜DSML｜｜ parameter>\n'
+        '<｜｜DSML｜｜ parameter name="description" string="true">List contents of Videos folder</｜｜DSML｜｜ parameter>\n'
+        "</｜｜DSML｜｜ invoke>\n"
+        "</｜｜DSML｜｜ calls>\n"
+    )
+    tcs, cleaned = parse_dsml_tool_calls(raw, ["Bash"])
+    assert len(tcs) == 1
+    assert tcs[0]["function"]["name"] == "Bash"
+    assert "C:/Users/Admin/Videos" in tcs[0]["function"]["arguments"]
+    assert "List contents of Videos folder" in tcs[0]["function"]["arguments"]
+    assert "<" not in cleaned
+    assert "I'll take a look." in cleaned

@@ -103,3 +103,34 @@ def test_split_safe_empty_string():
     # Edge case: chunk is empty / whitespace.
     out = _collect_text(s, [""])
     assert out == ""
+
+
+def test_sieve_fullwidth_unicode_pipes_streaming():
+    from tool_dsml import parse_dsml_tool_calls
+
+    def _parse(text):
+        return parse_dsml_tool_calls(text, ["Bash"])
+
+    s = StreamSieve(parse_fn=_parse)
+    chunks = [
+        "I'll take a look.\n\n",
+        "<",
+        "｜｜DSML｜｜ calls>\n",
+        '<｜｜DSML｜｜ invoke name="Bash">\n',
+        '<｜｜DSML｜｜ parameter name="command" string="true">ls -la "C:/Users/Admin/Videos"</｜｜DSML｜｜ parameter>\n',
+        '<｜｜DSML｜｜ parameter name="description" string="true">List contents of Videos folder</｜｜DSML｜｜ parameter>\n',
+        "</｜｜DSML｜｜ invoke>\n",
+        "</｜｜DSML｜｜ calls>\n",
+    ]
+    events = []
+    for c in chunks:
+        events.extend(s.feed(c))
+    events.extend(s.flush())
+
+    text_parts = [e.data for e in events if e.type == "text"]
+    tool_calls = [e.data for e in events if e.type == "tool_calls"]
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0][0]["function"]["name"] == "Bash"
+    assert "I'll take a look." in "".join(text_parts)
+    assert "<｜｜DSML｜｜" not in "".join(text_parts)

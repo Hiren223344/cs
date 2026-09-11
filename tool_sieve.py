@@ -11,6 +11,7 @@ v2.2.0 fixes:
   or malformed model output.
 """
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -40,17 +41,52 @@ class StreamSieve:
     _TOOL_STARTS = [
         "<|DSML|tool_calls>",
         "|DSML|tool_calls>",
+        "<|DSML|calls>",
+        "|DSML|calls>",
         "<tool_calls>",
+        "<calls>",
         "<tool_call>",
         "<invoke ",
+        "<invoke\t",
+        "<invoke\n",
+        "<invoke>",
         "<|DSML|invoke ",
         "|DSML|invoke ",
+        "<||DSML|| tool_calls>",
+        "<||DSML|| calls>",
+        "<||DSML|| invoke ",
+        "||DSML|| tool_calls>",
+        "||DSML|| calls>",
+        "||DSML|| invoke ",
+        "<｜DSML｜tool_calls>",
+        "｜DSML｜tool_calls>",
+        "<｜DSML｜calls>",
+        "｜DSML｜calls>",
+        "<｜DSML｜invoke ",
+        "｜DSML｜invoke ",
+        "<｜｜DSML｜｜ tool_calls>",
+        "｜｜DSML｜｜ tool_calls>",
+        "<｜｜DSML｜｜ calls>",
+        "｜｜DSML｜｜ calls>",
+        "<｜｜DSML｜｜tool_calls>",
+        "｜｜DSML｜｜tool_calls>",
+        "<｜｜DSML｜｜calls>",
+        "｜｜DSML｜｜calls>",
+        "<｜｜DSML｜｜ invoke ",
+        "｜｜DSML｜｜ invoke ",
+        "<｜｜DSML｜｜invoke ",
+        "｜｜DSML｜｜invoke ",
     ]
 
     # Plain prefixes that *could* grow into a tool call tag. Used to decide
     # how much of the tail to hold while we wait for more characters.
     _TOOL_PREFIXES = (
-        "<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke",
+        "<|DSML|", "|DSML|",
+        "<||DSML||", "||DSML||",
+        "<｜DSML｜", "｜DSML｜",
+        "<｜｜DSML｜｜", "｜｜DSML｜｜",
+        "<tool_calls", "<calls", "<tool_call", "<invoke",
+        "<|", "<||", "<｜", "<｜｜",
     )
 
     def __init__(self, parse_fn: Callable | None = None,
@@ -209,7 +245,7 @@ class StreamSieve:
         if not text:
             return "", ""
         last_lt = text.rfind("<")
-        last_pipe = text.rfind("|")
+        last_pipe = max(text.rfind("|"), text.rfind("\uff5c"))
         last_special = last_lt if last_lt >= last_pipe else last_pipe
         if last_special == -1:
             # No special characters at all: nothing can ever start a tag.
@@ -236,13 +272,15 @@ class StreamSieve:
             return None
         tool_calls, cleaned = self.parse_fn(self._capture_buf)
         if tool_calls:
+            self._capturing = False
+            self._capture_buf = ""
             return ("", tool_calls, "")
         return (self._capture_buf, None, "")
 
     def _is_capture_complete(self) -> bool:
-        buf = self._capture_buf
-        if "<|DSML|tool_calls>" in buf or "<tool_calls>" in buf:
-            return "</|DSML|tool_calls>" in buf or "</tool_calls>" in buf
-        if "<invoke " in buf or "<|DSML|invoke " in buf:
-            return "</invoke>" in buf or "</|DSML|invoke>" in buf
+        buf = self._capture_buf.replace("\uff5c", "|")
+        if re.search(r"<\s*\|*\s*DSML\s*\|*\s*(?:tool_calls|calls)\s*>", buf, re.I) or "<tool_calls>" in buf or "<calls>" in buf:
+            return bool(re.search(r"</\s*\|*\s*DSML\s*\|*\s*(?:tool_calls|calls)\s*>", buf, re.I) or "</tool_calls>" in buf or "</calls>" in buf)
+        if "<invoke" in buf or re.search(r"<\s*\|*\s*DSML\s*\|*\s*invoke\b", buf, re.I):
+            return bool("</invoke>" in buf or re.search(r"</\s*\|*\s*DSML\s*\|*\s*invoke\s*>", buf, re.I))
         return False
