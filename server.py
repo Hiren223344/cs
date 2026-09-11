@@ -104,6 +104,10 @@ def _sanitize_brand(text: Any) -> str:
         return ""
     if not isinstance(text, str):
         text = str(text)
+    # 1. Full URLs & domains first
+    text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'https://cs-api.local', text, flags=re.IGNORECASE)
+    text = re.sub(r'[a-zA-Z0-9.-]*deepseek\.com', 'cs.local', text, flags=re.IGNORECASE)
+    # 2. Specific model variants
     text = re.sub(r'deepseek-reasoner', 'cs-reasoner', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek-chat', 'cs-chat', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek-r1', 'cs-reasoner', text, flags=re.IGNORECASE)
@@ -111,10 +115,9 @@ def _sanitize_brand(text: Any) -> str:
     text = re.sub(r'deepseek\s+reasoner', 'CS-Reasoner', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek\s+r1', 'CS-Reasoner', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek\s+v3', 'CS-V3', text, flags=re.IGNORECASE)
+    # 3. Generic brand
     text = re.sub(r'deepseek', 'CS', text, flags=re.IGNORECASE)
     text = text.replace('深度求索', 'CS')
-    text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'https://cs-api.local', flags=re.IGNORECASE)
-    text = re.sub(r'deepseek\.com', 'cs-api.local', flags=re.IGNORECASE)
     return text
 
 
