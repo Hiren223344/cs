@@ -98,6 +98,26 @@ def _sanitize_error_message(text: Any) -> str:
     return text
 
 
+def _sanitize_brand(text: Any) -> str:
+    """Sanitize any occurrences of DeepSeek brand in model outputs."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    text = re.sub(r'deepseek-reasoner', 'cs-reasoner', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek-chat', 'cs-chat', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek-r1', 'cs-reasoner', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek-v3', 'cs-v3', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek\s+reasoner', 'CS-Reasoner', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek\s+r1', 'CS-Reasoner', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek\s+v3', 'CS-V3', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek', 'CS', text, flags=re.IGNORECASE)
+    text = text.replace('深度求索', 'CS')
+    text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'https://cs-api.local', flags=re.IGNORECASE)
+    text = re.sub(r'deepseek\.com', 'cs-api.local', flags=re.IGNORECASE)
+    return text
+
+
 MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
@@ -187,7 +207,12 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="Chat API Proxy", version="2.2.0")
+app = FastAPI(title="CS API", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.get("/")
+async def root():
+    return {"status": "running", "service": "CS API", "version": "1.0.0"}
 
 
 @app.exception_handler(HTTPException)
@@ -237,6 +262,7 @@ else:
 @app.middleware("http")
 async def _add_security_headers(request: Request, call_next):
     response = await call_next(request)
+    response.headers["Server"] = "CS-API/1.0"
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -1024,6 +1050,9 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
     finally:
         acq.release()
 
+    content = _sanitize_brand(content)
+    if thinking:
+        thinking = _sanitize_brand(thinking)
     tool_names = _get_tool_names(tools)
     tool_calls, cleaned = _parse_response_for_tools(content, tool_names)
     total = prompt_tokens + count_text(cleaned or content)
@@ -1130,7 +1159,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                             break
                         continue
                     elif tt == "thinking":
-                        content = token.get("content", "")
+                        content = _sanitize_brand(token.get("content", ""))
                         if content:
                             completion_parts.append(content)
                             if not role_sent:
@@ -1144,14 +1173,15 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 for evt in sieve.feed(token):
                     if evt.type == "text":
                         if evt.data:
-                            completion_parts.append(evt.data)
+                            evt_text = _sanitize_brand(evt.data)
+                            completion_parts.append(evt_text)
                             if not role_sent:
                                 if thinking_mode:
                                     yield _openai_chunk(proxy_id, reasoning_content="", model=resp_model)
-                                yield _openai_chunk(proxy_id, content=evt.data, role="assistant", model=resp_model)
+                                yield _openai_chunk(proxy_id, content=evt_text, role="assistant", model=resp_model)
                                 role_sent = True
                             else:
-                                yield _openai_chunk(proxy_id, content=evt.data, model=resp_model)
+                                yield _openai_chunk(proxy_id, content=evt_text, model=resp_model)
                     elif evt.type == "tool_calls":
                         for chunk in _emit_tool_calls_chunks(evt.data, proxy_id, model=resp_model):
                             yield chunk
@@ -1163,14 +1193,15 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             had_tool = False
             for evt in sieve.flush():
                 if evt.type == "text" and evt.data:
-                    completion_parts.append(evt.data)
+                    evt_text = _sanitize_brand(evt.data)
+                    completion_parts.append(evt_text)
                     if not role_sent:
                         if thinking_mode:
                             yield _openai_chunk(proxy_id, reasoning_content="", model=resp_model)
-                        yield _openai_chunk(proxy_id, content=evt.data, role="assistant", model=resp_model)
+                        yield _openai_chunk(proxy_id, content=evt_text, role="assistant", model=resp_model)
                         role_sent = True
                     else:
-                        yield _openai_chunk(proxy_id, content=evt.data, model=resp_model)
+                        yield _openai_chunk(proxy_id, content=evt_text, model=resp_model)
                 elif evt.type == "tool_calls":
                     had_tool = True
                     for chunk in _emit_tool_calls_chunks(evt.data, proxy_id, model=resp_model):

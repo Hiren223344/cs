@@ -13,7 +13,7 @@ from typing import Any
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = os.environ.get("LOG_FORMAT", "json").lower()  # json | text
-_LOGGER_NAME = "ds2api"
+_LOGGER_NAME = "cs-api"
 
 
 class _JsonFormatter(logging.Formatter):

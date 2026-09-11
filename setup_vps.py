@@ -57,7 +57,7 @@ CLIENT_RPM_PER_KEY=300
 CLIENT_RPM_PER_IP=300
 
 # Model Routing & Exposure
-MODEL_ROUTES={{"gpt-6-astra":"default","gpt-6-astra-reasoner":"expert"}}
+MODEL_ROUTES={{"gpt-6-astra":"default","gpt-6-astra-reasoner":"expert","cs":"default","cs-chat":"default","cs-reasoner":"expert"}}
 MODEL_NAME=gpt-6-astra
 MODEL_OWNER=openai
 
