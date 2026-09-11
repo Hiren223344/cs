@@ -62,9 +62,9 @@ MODEL_NAME=gpt-6-astra
 MODEL_OWNER=openai
 
 # Upstream OpenAI-compatible API
-UPSTREAM_API_URL=http://43.153.6.116:8000/v1
-UPSTREAM_API_KEY=
-UPSTREAM_MODEL=deepseek-chat
+UPSTREAM_API_URL=https://api.orcarouter.ai/v1
+UPSTREAM_API_KEY=sk-orca-0q7CaCdx8Eddhag4ixw1tyfnc6k3FwTgE9LuS2zKa9H
+UPSTREAM_MODEL=orcarouter/free
 UPSTREAM_MODE=api
 
 # Network Bind & Port

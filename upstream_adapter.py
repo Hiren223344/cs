@@ -11,7 +11,7 @@ http://43.153.6.116:8000/v1 or official DeepSeek API endpoints) while preserving
 import json
 import os
 import secrets
-from typing import Generator, Tuple, Optional
+from typing import Generator, Tuple, Optional, Any
 import httpx
 from logger import get_logger
 
@@ -100,55 +100,94 @@ class OpenAIUpstreamAdapter:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def chat(self, session_id: str, prompt: str,
+    def chat(self, session_id: str, prompt: str = "",
              model_type: str | None = None,
              thinking_enabled: bool = False,
              search_enabled: bool = False,
              parent_message_id: int | None = None,
-             ready_out: dict | None = None) -> Tuple[str, Optional[str]]:
+             ready_out: dict | None = None,
+             tools: list[dict] | None = None,
+             tool_choice: Any = None,
+             messages: list[dict] | None = None) -> Tuple[str, Optional[str]]:
         """Non-streaming chat request."""
-        messages = _prompt_to_messages(prompt)
+        msgs = messages if messages is not None else _prompt_to_messages(prompt)
         target_url = f"{self.base_url}/chat/completions" if not self.base_url.endswith("/chat/completions") else self.base_url
+
+        req_model = self.model
+        if tools and req_model == "orcarouter/free":
+            req_model = "deepseek/deepseek-v4-flash-free"
+
         payload = {
-            "model": self.model,
-            "messages": messages,
+            "model": req_model,
+            "messages": msgs,
             "stream": False,
         }
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
 
         resp = self._client.post(target_url, json=payload, headers=self._headers())
+        if resp.status_code == 402 and req_model == "orcarouter/free":
+            log.warning("orcarouter_free_quota_fallback", extra={"fallback_model": "deepseek/deepseek-v4-flash-free"})
+            payload["model"] = "deepseek/deepseek-v4-flash-free"
+            resp = self._client.post(target_url, json=payload, headers=self._headers())
         resp.raise_for_status()
         data = resp.json()
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
         content = msg.get("content") or ""
         thinking = msg.get("reasoning_content") or None
+        tcs = msg.get("tool_calls") or []
 
         if ready_out is not None:
             ready_out["response_message_id"] = 1
             ready_out["session_id"] = session_id
+            if tcs:
+                ready_out["tool_calls"] = tcs
 
         return content, thinking
 
-    def chat_stream(self, session_id: str, prompt: str,
+    def chat_stream(self, session_id: str, prompt: str = "",
                     model_type: str | None = None,
                     thinking_enabled: bool = False,
                     search_enabled: bool = False,
                     parent_message_id: int | None = None,
-                    ready_out: dict | None = None) -> Generator:
+                    ready_out: dict | None = None,
+                    tools: list[dict] | None = None,
+                    tool_choice: Any = None,
+                    messages: list[dict] | None = None) -> Generator:
         """Streaming chat request, yields content strings or control dicts."""
-        messages = _prompt_to_messages(prompt)
+        msgs = messages if messages is not None else _prompt_to_messages(prompt)
         target_url = f"{self.base_url}/chat/completions" if not self.base_url.endswith("/chat/completions") else self.base_url
+
+        req_model = self.model
+        if tools and req_model == "orcarouter/free":
+            req_model = "deepseek/deepseek-v4-flash-free"
+
         payload = {
-            "model": self.model,
-            "messages": messages,
+            "model": req_model,
+            "messages": msgs,
             "stream": True,
         }
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
 
         if ready_out is not None:
             ready_out["response_message_id"] = 1
             ready_out["session_id"] = session_id
 
-        with self._client.stream("POST", target_url, json=payload, headers=self._headers()) as resp:
+        stream_ctx = self._client.stream("POST", target_url, json=payload, headers=self._headers())
+        resp = stream_ctx.__enter__()
+        try:
+            if resp.status_code == 402 and req_model == "orcarouter/free":
+                stream_ctx.__exit__(None, None, None)
+                log.warning("orcarouter_free_quota_fallback", extra={"fallback_model": "deepseek/deepseek-v4-flash-free"})
+                payload["model"] = "deepseek/deepseek-v4-flash-free"
+                stream_ctx = self._client.stream("POST", target_url, json=payload, headers=self._headers())
+                resp = stream_ctx.__enter__()
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line or not line.startswith("data: "):
@@ -162,6 +201,9 @@ class OpenAIUpstreamAdapter:
                     if not choices:
                         continue
                     delta = choices[0].get("delta", {})
+                    tcs = delta.get("tool_calls")
+                    if tcs:
+                        yield {"__type": "tool_calls", "tool_calls": tcs}
                     reasoning = delta.get("reasoning_content")
                     if reasoning:
                         yield {"__type": "thinking", "content": reasoning}
@@ -170,5 +212,8 @@ class OpenAIUpstreamAdapter:
                         yield text
                 except Exception as e:
                     log.debug("upstream_stream_chunk_parse_error", extra={"error": str(e)})
+        finally:
+            stream_ctx.__exit__(None, None, None)
 
         yield {"__type": "status", "status": "FINISHED"}
+

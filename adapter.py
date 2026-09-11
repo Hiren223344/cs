@@ -18,7 +18,10 @@ import threading
 import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from wasmtime import Store, Module, Instance
+try:
+    from wasmtime import Store, Module, Instance
+except ImportError:
+    Store = Module = Instance = None
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -208,6 +211,8 @@ class _WASMSolver:
 
     def __init__(self):
         self._lock = threading.Lock()
+        if Store is None:
+            raise RuntimeError("wasmtime is required for DeepSeek PoW solving. Install wasmtime or use an API upstream.")
         self.store = Store()
         module = Module(self.store.engine, _WASM_BYTES)
         instance = Instance(self.store, module, [])

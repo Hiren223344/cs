@@ -204,6 +204,134 @@ def build_anthropic_prompt(
 
 # ---- Tool call format conversion ----
 
+def _format_tool_id(raw_id: str | None) -> str:
+    if not raw_id:
+        return f"toolu_{uuid.uuid4().hex[:24]}"
+    if raw_id.startswith("toolu_"):
+        return raw_id
+    if raw_id.startswith("call_"):
+        return f"toolu_{raw_id[5:]}"
+    return f"toolu_{raw_id}"
+
+
+def _format_openai_tool_id(raw_id: str | None) -> str:
+    if not raw_id:
+        return f"call_{uuid.uuid4().hex[:24]}"
+    if raw_id.startswith("toolu_"):
+        return f"call_{raw_id[6:]}"
+    if raw_id.startswith("call_"):
+        return raw_id
+    return f"call_{raw_id}"
+
+
+def anthropic_to_openai_tools(tools: list[Any] | None) -> list[dict] | None:
+    """Convert Anthropic tools list to OpenAI functions list."""
+    if not tools:
+        return None
+    res = []
+    for t in tools:
+        if isinstance(t, dict):
+            name = t.get("name", "")
+            desc = t.get("description", "") or ""
+            schema = t.get("input_schema") or {"type": "object", "properties": {}}
+        else:
+            name = getattr(t, "name", "")
+            desc = getattr(t, "description", "") or ""
+            schema = getattr(t, "input_schema", None) or {"type": "object", "properties": {}}
+        res.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": schema,
+            }
+        })
+    return res
+
+
+def anthropic_to_openai_messages(
+    messages: list[Any],
+    system: Any = None,
+) -> list[dict]:
+    """Convert Anthropic messages and system prompt to OpenAI structured messages."""
+    openai_msgs: list[dict] = []
+    sys_text = _extract_system_text(system)
+    if sys_text:
+        openai_msgs.append({"role": "system", "content": sys_text})
+
+    for m in messages:
+        if isinstance(m, dict):
+            role = m.get("role", "")
+            content = m.get("content", "")
+        else:
+            role = getattr(m, "role", "")
+            content = getattr(m, "content", "")
+
+        if role == "user":
+            if isinstance(content, str):
+                openai_msgs.append({"role": "user", "content": content})
+            elif isinstance(content, list):
+                user_texts = []
+                for b in content:
+                    b_type = b.get("type", "") if isinstance(b, dict) else getattr(b, "type", "")
+                    if b_type == "tool_result":
+                        t_id = b.get("tool_use_id", "") if isinstance(b, dict) else getattr(b, "tool_use_id", "")
+                        t_content = b.get("content", "") if isinstance(b, dict) else getattr(b, "content", "")
+                        if isinstance(t_content, list):
+                            t_content = _extract_text_from_blocks(t_content)
+                        elif not isinstance(t_content, str):
+                            t_content = json.dumps(t_content, ensure_ascii=False)
+                        openai_msgs.append({
+                            "role": "tool",
+                            "tool_call_id": _format_openai_tool_id(t_id),
+                            "content": t_content,
+                        })
+                    elif b_type == "text":
+                        txt = b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+                        if txt:
+                            user_texts.append(txt)
+                if user_texts:
+                    openai_msgs.append({"role": "user", "content": "\n".join(user_texts)})
+        elif role == "assistant":
+            if isinstance(content, str):
+                openai_msgs.append({"role": "assistant", "content": content})
+            elif isinstance(content, list):
+                asst_texts = []
+                tool_calls = []
+                for b in content:
+                    b_type = b.get("type", "") if isinstance(b, dict) else getattr(b, "type", "")
+                    if b_type == "text":
+                        txt = b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+                        if txt:
+                            asst_texts.append(txt)
+                    elif b_type == "tool_use":
+                        t_id = b.get("id", "") if isinstance(b, dict) else getattr(b, "id", "")
+                        t_name = b.get("name", "") if isinstance(b, dict) else getattr(b, "name", "")
+                        t_input = b.get("input", {}) if isinstance(b, dict) else getattr(b, "input", {})
+                        if isinstance(t_input, dict):
+                            args_str = json.dumps(t_input, ensure_ascii=False)
+                        elif isinstance(t_input, str):
+                            args_str = t_input
+                        else:
+                            args_str = json.dumps(t_input, ensure_ascii=False)
+                        tool_calls.append({
+                            "id": _format_openai_tool_id(t_id),
+                            "type": "function",
+                            "function": {
+                                "name": t_name,
+                                "arguments": args_str,
+                            }
+                        })
+                msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "\n".join(asst_texts) if asst_texts else None,
+                }
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                openai_msgs.append(msg)
+    return openai_msgs
+
+
 def _dsml_toolcalls_to_anthropic(tool_calls: list[dict]) -> list[dict]:
     """Convert DSML/OpenAI tool_calls format to Anthropic tool_use blocks."""
     blocks = []
@@ -216,7 +344,7 @@ def _dsml_toolcalls_to_anthropic(tool_calls: list[dict]) -> list[dict]:
             args = {}
         blocks.append({
             "type": "tool_use",
-            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+            "id": _format_tool_id(tc.get("id")),
             "name": fn.get("name", ""),
             "input": args,
         })
@@ -234,7 +362,7 @@ def _message_start(msg_id: str, model: str) -> str:
         "id": msg_id, "type": "message", "role": "assistant",
         "content": [], "model": model,
         "stop_reason": None, "stop_sequence": None,
-        "usage": {"input_tokens": -1, "output_tokens": -1},
+        "usage": {"input_tokens": 10, "output_tokens": 1},
     }
     return f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': msg}, ensure_ascii=False)}\n\n"
 
@@ -253,12 +381,12 @@ def _block_stop(index: int) -> str:
     return f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
 
 
-def _message_delta(stop_reason: str = "end_turn") -> str:
-    return f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': -1}}, ensure_ascii=False)}\n\n"
+def _message_delta(stop_reason: str = "end_turn", output_tokens: int = 1) -> str:
+    return f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': max(1, output_tokens)}}, ensure_ascii=False)}\n\n"
 
 
 def _message_stop() -> str:
-    return "event: message_stop\ndata: {}\n\n"
+    return f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 # ---- Non-streaming response builder ----
@@ -293,7 +421,7 @@ def build_nonstream_response(
         "content": content, "model": model,
         "stop_reason": "tool_use" if tool_calls else "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": -1, "output_tokens": -1},
+        "usage": {"input_tokens": 10, "output_tokens": 10},
     }
 
 
@@ -333,12 +461,14 @@ def stream_response(
     parse_fn = lambda text: parse_dsml_tool_calls(text, tool_names)
     sieve = StreamSieve(parse_fn=parse_fn)
     full_buf = ""
+    tool_state: dict[int, dict] = {}
+    had_native_tools = False
 
     for token in token_stream:
         if isinstance(token, dict):
             tt = token.get("__type")
             if tt == "status":
-                if token["status"] == "FINISHED":
+                if token.get("status") == "FINISHED":
                     break
                 continue
             elif tt == "thinking":
@@ -349,6 +479,41 @@ def stream_response(
                     if not in_thinking:
                         yield from _open_thinking()
                     yield _block_delta(idx, "thinking_delta", thinking=content)
+                continue
+            elif tt == "tool_calls":
+                had_native_tools = True
+                for evt in sieve.flush():
+                    if evt.type == "text" and evt.data:
+                        if in_thinking:
+                            yield from _close()
+                        if not in_text:
+                            yield from _open_text()
+                        yield _block_delta(idx, "text_delta", text=evt.data)
+                if in_thinking or in_text:
+                    yield from _close()
+                tcs = token.get("tool_calls", [])
+                for tc in tcs:
+                    tc_idx = tc.get("index", 0)
+                    if tc_idx not in tool_state:
+                        block_i = idx
+                        idx += 1
+                        raw_id = tc.get("id") or f"call_{uuid.uuid4().hex[:16]}"
+                        tool_id = _format_tool_id(raw_id)
+                        tool_name = tc.get("function", {}).get("name", "")
+                        tool_state[tc_idx] = {
+                            "block_index": block_i,
+                            "id": tool_id,
+                            "name": tool_name,
+                            "stopped": False,
+                        }
+                        yield _block_start(block_i, "tool_use", id=tool_id, name=tool_name, input={})
+                    else:
+                        if not tool_state[tc_idx]["name"] and tc.get("function", {}).get("name"):
+                            tool_state[tc_idx]["name"] = tc["function"]["name"]
+
+                    arg_chunk = tc.get("function", {}).get("arguments", "")
+                    if arg_chunk:
+                        yield _block_delta(tool_state[tc_idx]["block_index"], "input_json_delta", partial_json=arg_chunk)
                 continue
 
         # Normal text token — feed to sieve
@@ -367,6 +532,15 @@ def stream_response(
                 yield _message_delta("tool_use")
                 yield _message_stop()
                 return
+
+    if had_native_tools:
+        for item in tool_state.values():
+            if not item["stopped"]:
+                yield _block_stop(item["block_index"])
+                item["stopped"] = True
+        yield _message_delta("tool_use", output_tokens=10)
+        yield _message_stop()
+        return
 
     # Flush sieve
     for evt in sieve.flush():
@@ -408,7 +582,7 @@ def _emit_tool_use_blocks(tool_calls: list[dict], start_index: int):
             args = json.loads(args_str)
         except (json.JSONDecodeError, ValueError):
             args = {}
-        tool_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
+        tool_id = _format_tool_id(tc.get("id"))
         yield _block_start(start_index + i, "tool_use", id=tool_id,
                            name=fn.get("name", ""), input={})
         json_input = json.dumps(args, ensure_ascii=False)

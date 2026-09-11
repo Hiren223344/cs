@@ -52,6 +52,8 @@ from anthropic_format import (
     build_nonstream_response,
     stream_response,
     _msg_id,
+    anthropic_to_openai_messages,
+    anthropic_to_openai_tools,
 )
 from logger import get_logger, configure_from_env
 from crypto import is_enabled as crypto_is_enabled
@@ -140,9 +142,9 @@ ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").spli
 ALLOW_CREDENTIALS = bool(ALLOWED_ORIGINS) and os.environ.get("ALLOW_CORS_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # External OpenAI-compatible Upstream Configuration
-UPSTREAM_API_URL = os.environ.get("UPSTREAM_API_URL", "").strip()
-UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "").strip()
-UPSTREAM_MODEL = os.environ.get("UPSTREAM_MODEL", "deepseek-chat").strip()
+UPSTREAM_API_URL = os.environ.get("UPSTREAM_API_URL", "https://api.orcarouter.ai/v1").strip()
+UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "sk-orca-0q7CaCdx8Eddhag4ixw1tyfnc6k3FwTgE9LuS2zKa9H").strip()
+UPSTREAM_MODEL = os.environ.get("UPSTREAM_MODEL", "orcarouter/free").strip()
 UPSTREAM_MODE = os.environ.get("UPSTREAM_MODE", "api" if UPSTREAM_API_URL else "pool").strip().lower()
 
 
@@ -562,10 +564,15 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
     # requests don't hold accounts busy.
     _UPSTREAM_LIMITER.acquire()
     try:
+        cached = SESSION_CACHE.get(cache_key) if cache_key else None
+        if cached and cached.account_id and cached.account_id != "upstream_api":
+            acct = pool.acquire_by_id(cached.account_id)
+            if acct is not None:
+                return AcquiredAccount(acct, cache_key=cache_key)
+
         if UPSTREAM_API_URL and UPSTREAM_MODE == "api" and UPSTREAM_API_ACCT is not None:
             return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
 
-        cached = SESSION_CACHE.get(cache_key) if cache_key else None
         acct = pool.acquire_by_id(cached.account_id) if cached and cached.account_id else None
         if acct is None:
             try:
@@ -640,6 +647,19 @@ def _extract_text(content: Union[str, list[ContentPart], None]) -> str:
     return " ".join(
         p.text for p in content if p.type == "text" and p.text
     )
+
+
+def _chat_message_to_dict(m: ChatMessage) -> dict:
+    d: dict[str, Any] = {"role": m.role}
+    if m.content is not None:
+        d["content"] = _extract_text(m.content)
+    else:
+        d["content"] = None
+    if m.tool_calls:
+        d["tool_calls"] = [tc.model_dump() for tc in m.tool_calls]
+    if m.tool_call_id:
+        d["tool_call_id"] = m.tool_call_id
+    return d
 
 
 def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = None,
@@ -787,6 +807,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     _check_api_auth(request)
     rate_headers = _check_rate_limit(request)
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    api_messages = [_chat_message_to_dict(m) for m in req.messages]
+    api_tools = [t.model_dump() for t in req.tools] if req.tools else None
     prompt = _build_prompt(req.messages, req.tools, req.tool_choice)
 
     # Resolve model_type / thinking / search from MODEL_ROUTES first, then
@@ -828,10 +850,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     resp_model = _normalize_response_model(req.model)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
-                                    cache_key=_cache_key(request, "stream", openai_user), resp_model=resp_model)
+                                    cache_key=_cache_key(request, "stream", openai_user), resp_model=resp_model,
+                                    api_messages=api_messages, api_tools=api_tools, tool_choice=req.tool_choice)
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
-                             cache_key=_cache_key(request, "nonstream", openai_user), resp_model=resp_model)
+                             cache_key=_cache_key(request, "nonstream", openai_user), resp_model=resp_model,
+                             api_messages=api_messages, api_tools=api_tools, tool_choice=req.tool_choice)
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -854,6 +878,8 @@ async def messages(req: AnthropicRequest, request: Request):
         tools=tools_dict,
         system_str=system_str,
     )
+    api_messages = anthropic_to_openai_messages(req.messages, system=req.system)
+    api_tools = anthropic_to_openai_tools(req.tools)
 
     # Resolve model_type / thinking / search from MODEL_ROUTES first, then
     # MODE/THINKING/SEARCH env vars, then the per-request fields.
@@ -899,32 +925,46 @@ async def messages(req: AnthropicRequest, request: Request):
                                        model_type=model_type, thinking_mode=thinking,
                                        search_enabled=search,
                                        rate_headers=rate_headers,
-                                       cache_key=_cache_key(request, "stream", anth_user))
+                                       cache_key=_cache_key(request, "stream", anth_user),
+                                       api_messages=api_messages,
+                                       api_tools=api_tools)
 
     return _anthropic_nonstream(proxy_id, prompt, tool_names,
                                 model_type=model_type, thinking_mode=thinking,
                                 search_enabled=search,
-                                cache_key=_cache_key(request, "nonstream", anth_user))
+                                cache_key=_cache_key(request, "nonstream", anth_user),
+                                api_messages=api_messages,
+                                api_tools=api_tools)
 
 
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False,
-                         cache_key: str | None = None):
+                         cache_key: str | None = None,
+                         api_messages: list[dict] | None = None,
+                         api_tools: list[dict] | None = None):
     max_tries = max(1, pool.count())
     content = ""
     thinking = None
     for attempt in range(max_tries):
         acq = _acquire(cache_key=cache_key if attempt == 0 else None)
         try:
-            eff = acq.prepare_prompt(prompt)
             ds_id = acq.create_session()
             t0 = time.time()
             ready_out: dict = {}
-            content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
-                                                  thinking_enabled=thinking_mode, search_enabled=search_enabled,
-                                                  parent_message_id=acq.parent_message_id,
-                                                  ready_out=ready_out)
+            if getattr(acq.acct, "is_api", False):
+                content, thinking = acq.adapter.chat(ds_id, "", model_type=model_type,
+                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                      parent_message_id=acq.parent_message_id,
+                                                      ready_out=ready_out,
+                                                      tools=api_tools,
+                                                      messages=api_messages)
+            else:
+                eff = acq.prepare_prompt(prompt)
+                content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                      parent_message_id=acq.parent_message_id,
+                                                      ready_out=ready_out)
             if ready_out.get("response_message_id") is not None:
                 acq.record_message_id(ready_out["response_message_id"],
                                       ready_out.get("session_id"),
@@ -966,14 +1006,22 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
             acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
             try:
-                eff = acq.prepare_prompt(prompt)
                 ds_id = acq.create_session()
                 t0 = time.time()
                 ready_out = {}
-                content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
-                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
-                                                      parent_message_id=acq.parent_message_id,
-                                                      ready_out=ready_out)
+                if getattr(acq.acct, "is_api", False):
+                    content, thinking = acq.adapter.chat(ds_id, "", model_type=model_type,
+                                                          thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                          parent_message_id=acq.parent_message_id,
+                                                          ready_out=ready_out,
+                                                          tools=api_tools,
+                                                          messages=api_messages)
+                else:
+                    eff = acq.prepare_prompt(prompt)
+                    content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                          thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                          parent_message_id=acq.parent_message_id,
+                                                          ready_out=ready_out)
                 get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
             finally:
                 acq.release()
@@ -983,7 +1031,11 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
     content = _sanitize_brand(content)
     if thinking:
         thinking = _sanitize_brand(thinking)
-    tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
+    if ready_out.get("tool_calls"):
+        tool_calls = ready_out["tool_calls"]
+        cleaned = content
+    else:
+        tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
     return build_nonstream_response(
         msg_id, MODEL_NAME,
         content_text=cleaned or content,
@@ -996,7 +1048,9 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             model_type: str | None = None,
                             thinking_mode: bool = False, search_enabled: bool = False,
                             rate_headers: dict | None = None,
-                            cache_key: str | None = None):
+                            cache_key: str | None = None,
+                            api_messages: list[dict] | None = None,
+                            api_tools: list[dict] | None = None):
     max_tries = max(1, pool.count())
     acq = None
     stream_gen = None
@@ -1006,16 +1060,28 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
     for attempt in range(max_tries):
         acq = _acquire(cache_key=cache_key if attempt == 0 else None)
         try:
-            eff = acq.prepare_prompt(prompt)
             ds_id = acq.create_session()
-            stream_gen = acq.adapter.chat_stream(
-                ds_id, eff,
-                model_type=model_type,
-                thinking_enabled=thinking_mode,
-                search_enabled=search_enabled,
-                parent_message_id=acq.parent_message_id,
-                ready_out=ready_out
-            )
+            if getattr(acq.acct, "is_api", False):
+                stream_gen = acq.adapter.chat_stream(
+                    ds_id, "",
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out,
+                    tools=api_tools,
+                    messages=api_messages,
+                )
+            else:
+                eff = acq.prepare_prompt(prompt)
+                stream_gen = acq.adapter.chat_stream(
+                    ds_id, eff,
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out
+                )
             first_token = next(stream_gen, None)
             break
         except UserMutedError as e:
@@ -1038,16 +1104,28 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
         if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
             acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
-            eff = acq.prepare_prompt(prompt)
             ds_id = acq.create_session()
-            stream_gen = acq.adapter.chat_stream(
-                ds_id, eff,
-                model_type=model_type,
-                thinking_enabled=thinking_mode,
-                search_enabled=search_enabled,
-                parent_message_id=acq.parent_message_id,
-                ready_out=ready_out
-            )
+            if getattr(acq.acct, "is_api", False):
+                stream_gen = acq.adapter.chat_stream(
+                    ds_id, "",
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out,
+                    tools=api_tools,
+                    messages=api_messages,
+                )
+            else:
+                eff = acq.prepare_prompt(prompt)
+                stream_gen = acq.adapter.chat_stream(
+                    ds_id, eff,
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out
+                )
             first_token = next(stream_gen, None)
         else:
             raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
@@ -1108,23 +1186,36 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
                       model_type: str | None = None,
                       thinking_mode: bool = False, search_enabled: bool = False,
                       cache_key: str | None = None,
-                      resp_model: str = MODEL_NAME):
+                      resp_model: str = MODEL_NAME,
+                      api_messages: list[dict] | None = None,
+                      api_tools: list[dict] | None = None,
+                      tool_choice: Any = None):
     """Non-streaming completion with tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
     max_tries = max(1, pool.count())
     content = ""
     thinking = None
+    ready_out: dict = {}
     for attempt in range(max_tries):
         acq = _acquire(cache_key=cache_key if attempt == 0 else None)
         try:
-            eff = acq.prepare_prompt(prompt)
             ds_id = acq.create_session()
             t0 = time.time()
-            ready_out: dict = {}
-            content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
-                                                  thinking_enabled=thinking_mode, search_enabled=search_enabled,
-                                                  parent_message_id=acq.parent_message_id,
-                                                  ready_out=ready_out)
+            ready_out = {}
+            if getattr(acq.acct, "is_api", False):
+                content, thinking = acq.adapter.chat(ds_id, "", model_type=model_type,
+                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                      parent_message_id=acq.parent_message_id,
+                                                      ready_out=ready_out,
+                                                      tools=api_tools,
+                                                      tool_choice=tool_choice,
+                                                      messages=api_messages)
+            else:
+                eff = acq.prepare_prompt(prompt)
+                content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                      parent_message_id=acq.parent_message_id,
+                                                      ready_out=ready_out)
             if ready_out.get("response_message_id") is not None:
                 acq.record_message_id(ready_out["response_message_id"],
                                       ready_out.get("session_id"),
@@ -1165,14 +1256,23 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
             acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
             try:
-                eff = acq.prepare_prompt(prompt)
                 ds_id = acq.create_session()
                 t0 = time.time()
                 ready_out = {}
-                content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
-                                                      thinking_enabled=thinking_mode, search_enabled=search_enabled,
-                                                      parent_message_id=acq.parent_message_id,
-                                                      ready_out=ready_out)
+                if getattr(acq.acct, "is_api", False):
+                    content, thinking = acq.adapter.chat(ds_id, "", model_type=model_type,
+                                                          thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                          parent_message_id=acq.parent_message_id,
+                                                          ready_out=ready_out,
+                                                          tools=api_tools,
+                                                          tool_choice=tool_choice,
+                                                          messages=api_messages)
+                else:
+                    eff = acq.prepare_prompt(prompt)
+                    content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                          thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                          parent_message_id=acq.parent_message_id,
+                                                          ready_out=ready_out)
                 get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
             finally:
                 acq.release()
@@ -1182,6 +1282,31 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
     content = _sanitize_brand(content)
     if thinking:
         thinking = _sanitize_brand(thinking)
+
+    if ready_out.get("tool_calls"):
+        tool_calls = ready_out["tool_calls"]
+        total = prompt_tokens + count_text(content)
+        return {
+            "id": proxy_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": resp_model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": count_text(json.dumps(tool_calls)),
+                "total_tokens": total,
+            },
+        }
+
     tool_names = _get_tool_names(tools)
     tool_calls, cleaned = _parse_response_for_tools(content, tool_names)
     total = prompt_tokens + count_text(cleaned or content)
@@ -1234,7 +1359,10 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          thinking_mode: bool = False, search_enabled: bool = False,
                          rate_headers: dict | None = None,
                          cache_key: str | None = None,
-                         resp_model: str = MODEL_NAME):
+                         resp_model: str = MODEL_NAME,
+                         api_messages: list[dict] | None = None,
+                         api_tools: list[dict] | None = None,
+                         tool_choice: Any = None):
     """Streaming completion with StreamSieve tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
     max_tries = max(1, pool.count())
@@ -1246,16 +1374,29 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
     for attempt in range(max_tries):
         acq = _acquire(cache_key=cache_key if attempt == 0 else None)
         try:
-            eff = acq.prepare_prompt(prompt)
             ds_id = acq.create_session()
-            stream_iter = acq.adapter.chat_stream(
-                ds_id, eff,
-                model_type=model_type,
-                thinking_enabled=thinking_mode,
-                search_enabled=search_enabled,
-                parent_message_id=acq.parent_message_id,
-                ready_out=ready_out
-            )
+            if getattr(acq.acct, "is_api", False):
+                stream_iter = acq.adapter.chat_stream(
+                    ds_id, "",
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out,
+                    tools=api_tools,
+                    tool_choice=tool_choice,
+                    messages=api_messages,
+                )
+            else:
+                eff = acq.prepare_prompt(prompt)
+                stream_iter = acq.adapter.chat_stream(
+                    ds_id, eff,
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out
+                )
             first_token = next(stream_iter, None)
             break
         except UserMutedError as e:
@@ -1278,16 +1419,29 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
         if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
             acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
-            eff = acq.prepare_prompt(prompt)
             ds_id = acq.create_session()
-            stream_iter = acq.adapter.chat_stream(
-                ds_id, eff,
-                model_type=model_type,
-                thinking_enabled=thinking_mode,
-                search_enabled=search_enabled,
-                parent_message_id=acq.parent_message_id,
-                ready_out=ready_out
-            )
+            if getattr(acq.acct, "is_api", False):
+                stream_iter = acq.adapter.chat_stream(
+                    ds_id, "",
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out,
+                    tools=api_tools,
+                    tool_choice=tool_choice,
+                    messages=api_messages,
+                )
+            else:
+                eff = acq.prepare_prompt(prompt)
+                stream_iter = acq.adapter.chat_stream(
+                    ds_id, eff,
+                    model_type=model_type,
+                    thinking_enabled=thinking_mode,
+                    search_enabled=search_enabled,
+                    parent_message_id=acq.parent_message_id,
+                    ready_out=ready_out
+                )
             first_token = next(stream_iter, None)
         else:
             raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
@@ -1313,6 +1467,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
             sieve = StreamSieve(parse_fn=_parse_fn)
             full_buf = ""
+            had_native_tool = False
 
             def _record_turn():
                 if ready_out.get("response_message_id") is not None:
@@ -1324,7 +1479,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 if isinstance(token, dict):
                     tt = token.get("__type")
                     if tt == "status":
-                        if token["status"] == "FINISHED":
+                        if token.get("status") == "FINISHED":
                             break
                         continue
                     elif tt == "thinking":
@@ -1335,6 +1490,24 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                                 yield _openai_chunk(proxy_id, reasoning_content="", role="assistant", model=resp_model)
                                 role_sent = True
                             yield _openai_chunk(proxy_id, reasoning_content=content, model=resp_model)
+                        continue
+                    elif tt == "tool_calls":
+                        had_native_tool = True
+                        tcs = token.get("tool_calls", [])
+                        chunk = {
+                            "id": proxy_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": resp_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": tcs
+                                },
+                                "finish_reason": None,
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                         continue
 
                 # Normal text token (str) — feed to sieve
@@ -1357,6 +1530,23 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                         _record_turn()
                         yield "data: [DONE]\n\n"
                         return
+
+            if had_native_tool:
+                _record_turn()
+                finish_chunk = {
+                    "id": proxy_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": resp_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }]
+                }
+                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
             # Flush sieve
             had_tool = False
