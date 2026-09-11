@@ -86,6 +86,10 @@ def _sanitize_error_message(text: Any) -> str:
     text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'upstream', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek\.com', 'upstream', text, flags=re.IGNORECASE)
 
+    text = re.sub(r'user is muted', 'capacity reached', text, flags=re.IGNORECASE)
+    text = re.sub(r'上游账号已静音', '上游容量受限', text, flags=re.IGNORECASE)
+    text = re.sub(r'账号已静音', '容量受限', text, flags=re.IGNORECASE)
+
     def _repl(m):
         val = m.group(0)
         if val.isupper():
@@ -887,50 +891,62 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False,
                          cache_key: str | None = None):
-    acq = _acquire(cache_key=cache_key)
-    try:
-        eff = acq.prepare_prompt(prompt)
-        ds_id = acq.create_session()
-        t0 = time.time()
-        ready_out: dict = {}
-        content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
-                                              thinking_enabled=thinking_mode, search_enabled=search_enabled,
-                                              parent_message_id=acq.parent_message_id,
-                                              ready_out=ready_out)
-        if ready_out.get("response_message_id") is not None:
-            acq.record_message_id(ready_out["response_message_id"],
-                                  ready_out.get("session_id"),
-                                  full_prompt=prompt)
-        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
-    except RateLimitError as e:
-        # Match the OpenAI endpoint: upstream throttling is a client-visible
-        # 429, not an opaque Anthropic 500. This includes account mute errors
-        # because UserMutedError derives from RateLimitError.
-        get_stats().record(MODEL_NAME, 0, success=False)
-        if cache_key:
-            SESSION_CACHE.invalidate(cache_key)
-        raise HTTPException(
-            status_code=429,
-            detail=f"上游限流：{e.args[0] if e.args else '请求过于频繁'}，请稍后重试",
-        )
-    except UpstreamHintError as e:
-        get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
-        raise HTTPException(status_code=502, detail=str(e))
-    except UpstreamEmptyError:
-        # Empty upstream bodies are transient and should not poison the
-        # account pool, but the client still needs a meaningful 502.
-        get_stats().record(MODEL_NAME, 0, success=False)
-        if cache_key:
-            SESSION_CACHE.invalidate(cache_key)
-        raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
-    except Exception as e:
-        get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
-        raise
-    finally:
-        acq.release()
+    max_tries = max(1, pool.count())
+    content = ""
+    thinking = None
+    for attempt in range(max_tries):
+        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        try:
+            eff = acq.prepare_prompt(prompt)
+            ds_id = acq.create_session()
+            t0 = time.time()
+            ready_out: dict = {}
+            content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                  thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                  parent_message_id=acq.parent_message_id,
+                                                  ready_out=ready_out)
+            if ready_out.get("response_message_id") is not None:
+                acq.record_message_id(ready_out["response_message_id"],
+                                      ready_out.get("session_id"),
+                                      full_prompt=prompt)
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+            break
+        except UserMutedError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            log.warning("anthropic_nonstream_muted_failover", extra={"attempt": attempt})
+            continue
+        except RateLimitError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit reached on upstream capacity. Please retry shortly.",
+            )
+        except UpstreamHintError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            raise HTTPException(status_code=502, detail=_sanitize_error_message(str(e)))
+        except UpstreamEmptyError:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            raise HTTPException(status_code=502, detail="Upstream returned empty response, please retry")
+        except Exception as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            raise
+        finally:
+            acq.release()
+    else:
+        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
 
+    content = _sanitize_brand(content)
+    if thinking:
+        thinking = _sanitize_brand(thinking)
     tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
     return build_nonstream_response(
         msg_id, MODEL_NAME,
@@ -945,29 +961,60 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             thinking_mode: bool = False, search_enabled: bool = False,
                             rate_headers: dict | None = None,
                             cache_key: str | None = None):
-    acq = _acquire(cache_key=cache_key)
-    try:
-        eff = acq.prepare_prompt(prompt)
-        ds_id = acq.create_session()
-    except Exception as e:
-        get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
-        acq.release()
-        raise
+    max_tries = max(1, pool.count())
+    acq = None
+    stream_gen = None
+    ready_out: dict = {}
+    first_token = None
+
+    for attempt in range(max_tries):
+        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        try:
+            eff = acq.prepare_prompt(prompt)
+            ds_id = acq.create_session()
+            stream_gen = acq.adapter.chat_stream(
+                ds_id, eff,
+                model_type=model_type,
+                thinking_enabled=thinking_mode,
+                search_enabled=search_enabled,
+                parent_message_id=acq.parent_message_id,
+                ready_out=ready_out
+            )
+            first_token = next(stream_gen, None)
+            break
+        except UserMutedError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            acq.release()
+            acq = None
+            log.warning("anthropic_stream_muted_failover", extra={"attempt": attempt})
+            continue
+        except Exception as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            if acq:
+                pool.mark_error(acq.acct, str(e))
+                acq.release()
+                acq = None
+            raise
+    else:
+        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
+
     t0 = time.time()
+
+    def _token_source():
+        if first_token is not None:
+            yield first_token
+        for tok in stream_gen:
+            yield tok
 
     async def event_stream():
         nonlocal t0
-        ready_out: dict = {}
         try:
             for event in stream_response(
                 msg_id, MODEL_NAME,
-                acq.adapter.chat_stream(ds_id, eff,
-                                       model_type=model_type,
-                                       thinking_enabled=thinking_mode,
-                                       search_enabled=search_enabled,
-                                       parent_message_id=acq.parent_message_id,
-                                       ready_out=ready_out),
+                _token_source(),
                 tool_names,
                 thinking_mode=thinking_mode,
             ):
@@ -979,7 +1026,11 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
         except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
-            if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+            if isinstance(e, UserMutedError):
+                pool.mark_error(acq.acct, str(e))
+                if cache_key:
+                    SESSION_CACHE.invalidate(cache_key)
+            elif isinstance(e, (RateLimitError, UpstreamEmptyError)):
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
             else:
@@ -1007,51 +1058,59 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
                       thinking_mode: bool = False, search_enabled: bool = False,
                       cache_key: str | None = None,
                       resp_model: str = MODEL_NAME):
-    """Non-streaming completion with tool call detection."""
+    """Non-streaming completion with tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
-    acq = _acquire(cache_key=cache_key)
-    try:
-        eff = acq.prepare_prompt(prompt)
-        ds_id = acq.create_session()
-        t0 = time.time()
-        ready_out: dict = {}
-        content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
-                                              thinking_enabled=thinking_mode, search_enabled=search_enabled,
-                                              parent_message_id=acq.parent_message_id,
-                                              ready_out=ready_out)
-        if ready_out.get("response_message_id") is not None:
-            acq.record_message_id(ready_out["response_message_id"],
-                                  ready_out.get("session_id"),
-                                  full_prompt=prompt)
-        completion_tokens = count_text(content) + count_text(thinking)
-        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
-                           prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-    except RateLimitError as e:
-        # Rate limiting is a transient upstream state, not a credential
-        # problem — do NOT mark the account as errored, or the pool would
-        # drain to 503 once the limiter cools down. Invalidate the cached
-        # session so the next call starts fresh.
-        get_stats().record(MODEL_NAME, 0, success=False)
-        if cache_key:
-            SESSION_CACHE.invalidate(cache_key)
-        raise HTTPException(status_code=429, detail=f"上游限流：{e.args[0] if e.args else '请求过于频繁'}，请稍后重试")
-    except UpstreamHintError as e:
-        get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
-        raise HTTPException(status_code=502, detail=str(e))
-    except UpstreamEmptyError as e:
-        # Transient empty responses (stale pooled connection / upstream
-        # hiccup) — retried in the adapter already; do not poison the pool.
-        get_stats().record(MODEL_NAME, 0, success=False)
-        if cache_key:
-            SESSION_CACHE.invalidate(cache_key)
-        raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
-    except Exception as e:
-        get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
-        raise
-    finally:
-        acq.release()
+    max_tries = max(1, pool.count())
+    content = ""
+    thinking = None
+    for attempt in range(max_tries):
+        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        try:
+            eff = acq.prepare_prompt(prompt)
+            ds_id = acq.create_session()
+            t0 = time.time()
+            ready_out: dict = {}
+            content, thinking = acq.adapter.chat(ds_id, eff, model_type=model_type,
+                                                  thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                                  parent_message_id=acq.parent_message_id,
+                                                  ready_out=ready_out)
+            if ready_out.get("response_message_id") is not None:
+                acq.record_message_id(ready_out["response_message_id"],
+                                      ready_out.get("session_id"),
+                                      full_prompt=prompt)
+            completion_tokens = count_text(content) + count_text(thinking)
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
+                               prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+            break
+        except UserMutedError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            log.warning("openai_nonstream_muted_failover", extra={"attempt": attempt})
+            continue
+        except RateLimitError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            raise HTTPException(status_code=429, detail="Rate limit reached on upstream capacity. Please retry shortly.")
+        except UpstreamHintError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            raise HTTPException(status_code=502, detail=_sanitize_error_message(str(e)))
+        except UpstreamEmptyError as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            raise HTTPException(status_code=502, detail="Upstream returned empty response, please retry")
+        except Exception as e:
+            get_stats().record(MODEL_NAME, 0, success=False)
+            pool.mark_error(acq.acct, str(e))
+            raise
+        finally:
+            acq.release()
+    else:
+        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
 
     content = _sanitize_brand(content)
     if thinking:
@@ -1109,27 +1168,60 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          rate_headers: dict | None = None,
                          cache_key: str | None = None,
                          resp_model: str = MODEL_NAME):
-    """Streaming completion with StreamSieve tool call detection and expert mode support."""
+    """Streaming completion with StreamSieve tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
-    acq = _acquire(cache_key=cache_key)
-    try:
-        eff = acq.prepare_prompt(prompt)
-        ds_id = acq.create_session()
-    except Exception as e:
-        get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
-        pool.mark_error(acq.acct, str(e))
-        acq.release()
-        raise
+    max_tries = max(1, pool.count())
+    acq = None
+    stream_iter = None
+    ready_out: dict = {}
+    first_token = None
+
+    for attempt in range(max_tries):
+        acq = _acquire(cache_key=cache_key if attempt == 0 else None)
+        try:
+            eff = acq.prepare_prompt(prompt)
+            ds_id = acq.create_session()
+            stream_iter = acq.adapter.chat_stream(
+                ds_id, eff,
+                model_type=model_type,
+                thinking_enabled=thinking_mode,
+                search_enabled=search_enabled,
+                parent_message_id=acq.parent_message_id,
+                ready_out=ready_out
+            )
+            first_token = next(stream_iter, None)
+            break
+        except UserMutedError as e:
+            get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
+            pool.mark_error(acq.acct, str(e))
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+            acq.release()
+            acq = None
+            log.warning("openai_stream_muted_failover", extra={"attempt": attempt})
+            continue
+        except Exception as e:
+            get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
+            if acq:
+                pool.mark_error(acq.acct, str(e))
+                acq.release()
+                acq = None
+            raise
+    else:
+        raise HTTPException(status_code=429, detail="All upstream accounts temporarily at capacity. Please try again later.")
+
     tool_names = _get_tool_names(tools)
     t0 = time.time()
+
+    def _token_source():
+        if first_token is not None:
+            yield first_token
+        for tok in stream_iter:
+            yield tok
 
     async def event_stream():
         nonlocal t0
         completion_parts: list[str] = []
-        # Multi-turn: filled by adapter with the upstream response message id
-        # (and the actual session id after a retry-swap). Recorded into the
-        # session cache on success so the next turn has a valid parent.
-        ready_out: dict = {}
         try:
             yield _openai_chunk(proxy_id, finish=False, model=resp_model)
             role_sent = False
@@ -1141,20 +1233,12 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             full_buf = ""
 
             def _record_turn():
-                # Persist the upstream response message id (and the session
-                # actually used, e.g. after an internal retry swap) so the
-                # next turn's parent_message_id is valid.
                 if ready_out.get("response_message_id") is not None:
                     acq.record_message_id(ready_out["response_message_id"],
                                           ready_out.get("session_id"),
                                           full_prompt=prompt)
 
-            for token in acq.adapter.chat_stream(ds_id, eff,
-                                                  model_type=model_type,
-                                                  thinking_enabled=thinking_mode,
-                                                  search_enabled=search_enabled,
-                                                  parent_message_id=acq.parent_message_id,
-                                                  ready_out=ready_out):
+            for token in _token_source():
                 if isinstance(token, dict):
                     tt = token.get("__type")
                     if tt == "status":
@@ -1239,16 +1323,19 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
         except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False,
                                prompt_tokens=prompt_tokens)
-            # Rate limit / transient empty responses are not credential
-            # failures — keep the account usable instead of draining the pool.
-            if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+            if isinstance(e, UserMutedError):
+                pool.mark_error(acq.acct, str(e))
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
+                err_msg = "Upstream capacity temporarily exhausted. Please retry shortly."
+            elif isinstance(e, (RateLimitError, UpstreamEmptyError)):
+                if cache_key:
+                    SESSION_CACHE.invalidate(cache_key)
+                err_msg = _sanitize_error_message(str(e)[:500])
             else:
                 pool.mark_error(acq.acct, str(e))
+                err_msg = _sanitize_error_message(str(e)[:500])
             log.exception("openai_stream_failed")
-            # Emit a uniform error frame to the client, then [DONE] so the
-            # client SDK doesn't see a truncated stream.
             err = {
                 "id": proxy_id,
                 "object": "chat.completion.chunk",
@@ -1261,7 +1348,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 }],
                 "error": {
                     "type": "upstream_error",
-                    "message": _sanitize_error_message(str(e)[:500]),
+                    "message": err_msg,
                 },
             }
             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
