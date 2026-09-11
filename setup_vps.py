@@ -45,11 +45,16 @@ ACCOUNTS = [
 
 ENV_CONTENT = f"""# Client API Auth
 API_KEYS=sk-change-me
-ALLOW_UNAUTHENTICATED_API=false
+ALLOW_UNAUTHENTICATED_API=true
 
 # Admin Password
 DEEPSEEK_ADMIN_PASSWORD=change-me
 ALLOW_INSECURE_PUBLIC_DEFAULTS=true
+
+# Rate Limiting
+ENABLE_RATE_LIMIT=false
+CLIENT_RPM_PER_KEY=300
+CLIENT_RPM_PER_IP=300
 
 # Model Routing & Exposure
 MODEL_ROUTES={{"gpt-6-astra":"default","gpt-6-astra-reasoner":"expert"}}
