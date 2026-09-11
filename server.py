@@ -4,6 +4,7 @@ Supports streaming, tool calling (via DSML prompt injection), content parts, exp
 """
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -62,7 +63,41 @@ load_dotenv()
 configure_from_env()
 log = get_logger("server")
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-6-astra")
+
+
+def _normalize_response_model(model: Optional[str]) -> str:
+    """Ensure deepseek-chat/reasoner is not returned; returns gpt-6-astra equivalents."""
+    if not model or model == "deepseek-chat":
+        return MODEL_NAME
+    if model == "deepseek-reasoner":
+        return "gpt-6-astra-reasoner"
+    return model
+
+
+def _sanitize_error_message(text: Any) -> str:
+    """Replace occurrences of deepseek / DeepSeek with upstream equivalents in error messages."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    text = re.sub(r'deepseek-reasoner', 'gpt-6-astra-reasoner', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek-chat', 'gpt-6-astra', text, flags=re.IGNORECASE)
+    text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'upstream', text, flags=re.IGNORECASE)
+    text = re.sub(r'deepseek\.com', 'upstream', text, flags=re.IGNORECASE)
+
+    def _repl(m):
+        val = m.group(0)
+        if val.isupper():
+            return "UPSTREAM"
+        if val[0].isupper():
+            return "Upstream"
+        return "upstream"
+
+    text = re.sub(r'deepseek', _repl, text, flags=re.IGNORECASE)
+    return text
+
+
 MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
@@ -152,7 +187,33 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.2.0")
+app = FastAPI(title="Chat API Proxy", version="2.2.0")
+
+
+@app.exception_handler(HTTPException)
+async def _sanitized_http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, str):
+        detail = _sanitize_error_message(detail)
+    elif isinstance(detail, (dict, list)):
+        try:
+            detail = json.loads(_sanitize_error_message(json.dumps(detail, ensure_ascii=False)))
+        except Exception:
+            pass
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": detail},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def _sanitized_general_exception_handler(request: Request, exc: Exception):
+    sanitized = _sanitize_error_message(str(exc))
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"message": sanitized, "type": "upstream_error"}},
+    )
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -326,7 +387,7 @@ class ModelInfo(BaseModel):
     id: str
     object: str = "model"
     created: int
-    owned_by: str = "deepseek"
+    owned_by: str = os.environ.get("MODEL_OWNER", "openai")
 
 
 class ModelList(BaseModel):
@@ -575,7 +636,8 @@ def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = Non
 # ---- OpenAI SSE helpers ----
 
 def _openai_chunk(proxy_id: str, content: str = "", finish: bool = False,
-                  reasoning_content: str = None, role: str = None) -> str:
+                  reasoning_content: str = None, role: str = None,
+                  model: str = MODEL_NAME) -> str:
     delta = {}
     if not finish:
         if role:
@@ -593,13 +655,13 @@ def _openai_chunk(proxy_id: str, content: str = "", finish: bool = False,
         "id": proxy_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": MODEL_NAME,
+        "model": model,
         "choices": [choice],
     }
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def _emit_tool_calls_chunks(tool_calls: list[dict], chat_id: str) -> list[str]:
+def _emit_tool_calls_chunks(tool_calls: list[dict], chat_id: str, model: str = MODEL_NAME) -> list[str]:
     """生成 OpenAI 流式 tool_calls SSE 事件。"""
     chunks = []
     created = int(time.time())
@@ -615,7 +677,7 @@ def _emit_tool_calls_chunks(tool_calls: list[dict], chat_id: str) -> list[str]:
                 "function": {"name": tc["function"]["name"], "arguments": ""},
             }],
         }
-        chunks.append(f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_NAME, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}, ensure_ascii=False)}\n\n")
+        chunks.append(f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}, ensure_ascii=False)}\n\n")
         # 次帧：arguments
         delta2 = {
             "tool_calls": [{
@@ -623,9 +685,9 @@ def _emit_tool_calls_chunks(tool_calls: list[dict], chat_id: str) -> list[str]:
                 "function": {"arguments": tc["function"]["arguments"]},
             }],
         }
-        chunks.append(f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_NAME, 'choices': [{'index': 0, 'delta': delta2, 'finish_reason': None}]}, ensure_ascii=False)}\n\n")
+        chunks.append(f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': delta2, 'finish_reason': None}]}, ensure_ascii=False)}\n\n")
     # finish
-    chunks.append(f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_NAME, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]}, ensure_ascii=False)}\n\n")
+    chunks.append(f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]}, ensure_ascii=False)}\n\n")
     return chunks
 
 
@@ -710,12 +772,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # streamed call from a non-streaming call (or vice versa) makes the
     # upstream return an empty response. Same-mode multi-turn still works.
     openai_user = _extract_openai_user(req, request)
+    resp_model = _normalize_response_model(req.model)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
-                                    cache_key=_cache_key(request, "stream", openai_user))
+                                    cache_key=_cache_key(request, "stream", openai_user), resp_model=resp_model)
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
-                             cache_key=_cache_key(request, "nonstream", openai_user))
+                             cache_key=_cache_key(request, "nonstream", openai_user), resp_model=resp_model)
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -913,7 +976,8 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
 def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = None,
                       model_type: str | None = None,
                       thinking_mode: bool = False, search_enabled: bool = False,
-                      cache_key: str | None = None):
+                      cache_key: str | None = None,
+                      resp_model: str = MODEL_NAME):
     """Non-streaming completion with tool call detection."""
     prompt_tokens = count_text(prompt)
     acq = _acquire(cache_key=cache_key)
@@ -969,7 +1033,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             "id": proxy_id,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": MODEL_NAME,
+            "model": resp_model,
             "choices": [{
                 "index": 0,
                 "message": {
@@ -990,7 +1054,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         "id": proxy_id,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": MODEL_NAME,
+        "model": resp_model,
         "choices": [{
             "index": 0,
             "message": {
@@ -1011,7 +1075,8 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False,
                          rate_headers: dict | None = None,
-                         cache_key: str | None = None):
+                         cache_key: str | None = None,
+                         resp_model: str = MODEL_NAME):
     """Streaming completion with StreamSieve tool call detection and expert mode support."""
     prompt_tokens = count_text(prompt)
     acq = _acquire(cache_key=cache_key)
@@ -1034,7 +1099,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
         # session cache on success so the next turn has a valid parent.
         ready_out: dict = {}
         try:
-            yield _openai_chunk(proxy_id, finish=False)
+            yield _openai_chunk(proxy_id, finish=False, model=resp_model)
             role_sent = False
 
             def _parse_fn(text):
@@ -1069,9 +1134,9 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                         if content:
                             completion_parts.append(content)
                             if not role_sent:
-                                yield _openai_chunk(proxy_id, reasoning_content="", role="assistant")
+                                yield _openai_chunk(proxy_id, reasoning_content="", role="assistant", model=resp_model)
                                 role_sent = True
-                            yield _openai_chunk(proxy_id, reasoning_content=content)
+                            yield _openai_chunk(proxy_id, reasoning_content=content, model=resp_model)
                         continue
 
                 # Normal text token (str) — feed to sieve
@@ -1082,13 +1147,13 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                             completion_parts.append(evt.data)
                             if not role_sent:
                                 if thinking_mode:
-                                    yield _openai_chunk(proxy_id, reasoning_content="")
-                                yield _openai_chunk(proxy_id, content=evt.data, role="assistant")
+                                    yield _openai_chunk(proxy_id, reasoning_content="", model=resp_model)
+                                yield _openai_chunk(proxy_id, content=evt.data, role="assistant", model=resp_model)
                                 role_sent = True
                             else:
-                                yield _openai_chunk(proxy_id, content=evt.data)
+                                yield _openai_chunk(proxy_id, content=evt.data, model=resp_model)
                     elif evt.type == "tool_calls":
-                        for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
+                        for chunk in _emit_tool_calls_chunks(evt.data, proxy_id, model=resp_model):
                             yield chunk
                         _record_turn()
                         yield "data: [DONE]\n\n"
@@ -1101,14 +1166,14 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                     completion_parts.append(evt.data)
                     if not role_sent:
                         if thinking_mode:
-                            yield _openai_chunk(proxy_id, reasoning_content="")
-                        yield _openai_chunk(proxy_id, content=evt.data, role="assistant")
+                            yield _openai_chunk(proxy_id, reasoning_content="", model=resp_model)
+                        yield _openai_chunk(proxy_id, content=evt.data, role="assistant", model=resp_model)
                         role_sent = True
                     else:
-                        yield _openai_chunk(proxy_id, content=evt.data)
+                        yield _openai_chunk(proxy_id, content=evt.data, model=resp_model)
                 elif evt.type == "tool_calls":
                     had_tool = True
-                    for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
+                    for chunk in _emit_tool_calls_chunks(evt.data, proxy_id, model=resp_model):
                         yield chunk
 
             if had_tool:
@@ -1122,16 +1187,16 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 if tc_result:
                     if not role_sent:
                         if thinking_mode:
-                            yield _openai_chunk(proxy_id, reasoning_content="")
+                            yield _openai_chunk(proxy_id, reasoning_content="", model=resp_model)
                         role_sent = True
-                    for chunk in _emit_tool_calls_chunks(tc_result, proxy_id):
+                    for chunk in _emit_tool_calls_chunks(tc_result, proxy_id, model=resp_model):
                         yield chunk
                     _record_turn()
                     yield "data: [DONE]\n\n"
                     return
 
             _record_turn()
-            yield _openai_chunk(proxy_id, finish=True)
+            yield _openai_chunk(proxy_id, finish=True, model=resp_model)
             yield "data: [DONE]\n\n"
             completion_tokens = count_text("".join(completion_parts))
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
@@ -1154,7 +1219,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 "id": proxy_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": MODEL_NAME,
+                "model": resp_model,
                 "choices": [{
                     "index": 0,
                     "delta": {},
@@ -1162,7 +1227,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 }],
                 "error": {
                     "type": "upstream_error",
-                    "message": str(e)[:500],
+                    "message": _sanitize_error_message(str(e)[:500]),
                 },
             }
             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"

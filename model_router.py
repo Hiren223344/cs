@@ -114,6 +114,10 @@ class ModelRouter:
         if not model:
             return RouteDecision()
         route = self._routes.get(model)
+        if route is None and model == "deepseek-chat":
+            route = self._routes.get("gpt-6-astra") or self._routes.get(os.environ.get("MODEL_NAME", "gpt-6-astra"))
+        if route is None and model == "deepseek-reasoner":
+            route = self._routes.get("gpt-6-astra-reasoner") or _Route(model_type="expert")
         if route is None:
             return RouteDecision()
         return RouteDecision(
