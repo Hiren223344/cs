@@ -89,6 +89,12 @@ def _sanitize_error_message(text: Any) -> str:
     text = re.sub(r'deepseek-chat', 'gpt-6-astra', text, flags=re.IGNORECASE)
     text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'upstream', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek\.com', 'upstream', text, flags=re.IGNORECASE)
+    text = re.sub(r'https?://[a-zA-Z0-9.-]*kiosapi\.com[^\s]*', 'upstream', text, flags=re.IGNORECASE)
+    text = re.sub(r'kiosapi\.com', 'upstream', text, flags=re.IGNORECASE)
+    text = re.sub(r'kiosapi', 'upstream', text, flags=re.IGNORECASE)
+    text = re.sub(r'kios', 'upstream', text, flags=re.IGNORECASE)
+    text = re.sub(r'glm-5\.3', 'Fable 5.1', text, flags=re.IGNORECASE)
+    text = re.sub(r'kilo-auto', 'opus 5', text, flags=re.IGNORECASE)
 
     text = re.sub(r'user is muted', 'capacity reached', text, flags=re.IGNORECASE)
     text = re.sub(r'上游账号已静音', '上游容量受限', text, flags=re.IGNORECASE)
@@ -107,7 +113,7 @@ def _sanitize_error_message(text: Any) -> str:
 
 
 def _sanitize_brand(text: Any) -> str:
-    """Sanitize any occurrences of DeepSeek brand in model outputs."""
+    """Sanitize any occurrences of DeepSeek/Kios brand in model outputs."""
     if text is None:
         return ""
     if not isinstance(text, str):
@@ -115,6 +121,8 @@ def _sanitize_brand(text: Any) -> str:
     # 1. Full URLs & domains first
     text = re.sub(r'https?://[a-zA-Z0-9.-]*deepseek\.com[^\s]*', 'https://cs-api.local', text, flags=re.IGNORECASE)
     text = re.sub(r'[a-zA-Z0-9.-]*deepseek\.com', 'cs.local', text, flags=re.IGNORECASE)
+    text = re.sub(r'https?://[a-zA-Z0-9.-]*kiosapi\.com[^\s]*', 'https://cs-api.local', text, flags=re.IGNORECASE)
+    text = re.sub(r'[a-zA-Z0-9.-]*kiosapi\.com', 'cs.local', text, flags=re.IGNORECASE)
     # 2. Specific model variants
     text = re.sub(r'deepseek-reasoner', 'cs-reasoner', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek-chat', 'cs-chat', text, flags=re.IGNORECASE)
@@ -123,6 +131,12 @@ def _sanitize_brand(text: Any) -> str:
     text = re.sub(r'deepseek\s+reasoner', 'CS-Reasoner', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek\s+r1', 'CS-Reasoner', text, flags=re.IGNORECASE)
     text = re.sub(r'deepseek\s+v3', 'CS-V3', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bglm-5\.3\b', 'Fable 5.1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bkilo-auto\b', 'opus 5', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bChatGLM\b', 'Fable', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b智谱\b', 'CS', text)
+    text = re.sub(r'\bZhipu\b', 'CS', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bkios(?:api)?\b', 'CS', text, flags=re.IGNORECASE)
     # 3. Generic brand
     text = re.sub(r'deepseek', 'CS', text, flags=re.IGNORECASE)
     text = text.replace('深度求索', 'CS')
@@ -157,6 +171,7 @@ class ApiAccount:
     def __init__(self, base_url: str, api_key: str = "", model: str = "deepseek-chat", acct_id: str = "upstream_api"):
         self.id = acct_id
         self.email = acct_id
+        self.model = model
         self.is_api = True
         self.state = "idle"
         self.error_count = 0
@@ -183,6 +198,31 @@ def _mark_error_safe(acct: Any, error_msg: str = "") -> None:
 
 UPSTREAM_API_ACCT = ApiAccount(UPSTREAM_API_URL, UPSTREAM_API_KEY, UPSTREAM_MODEL, acct_id="upstream_api") if UPSTREAM_API_URL else None
 FALLBACK_API_ACCT = ApiAccount(FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL, acct_id="fallback_api") if FALLBACK_API_URL else None
+
+# Kios API Configuration (Routes Fable 5.1 -> glm-5.3, opus 5 -> kilo-auto)
+KIOS_API_URL = os.environ.get("KIOS_API_URL", "https://router.kiosapi.com/v1").strip()
+KIOS_API_KEY = os.environ.get("KIOS_API_KEY", "sk-ZD5ElGHGHqXdVc8KWnOKdbwhiFORVpx2XHxOIslap9AI8Mzi").strip()
+KIOS_FABLE_MODEL = os.environ.get("KIOS_FABLE_MODEL", "glm-5.3").strip()
+KIOS_OPUS_MODEL = os.environ.get("KIOS_OPUS_MODEL", "kilo-auto").strip()
+
+KIOS_FABLE_ACCT = ApiAccount(KIOS_API_URL, KIOS_API_KEY, KIOS_FABLE_MODEL, acct_id="kios_fable") if KIOS_API_URL else None
+KIOS_OPUS_ACCT = ApiAccount(KIOS_API_URL, KIOS_API_KEY, KIOS_OPUS_MODEL, acct_id="kios_opus") if KIOS_API_URL else None
+
+
+def _resolve_model_target(model: Optional[str]) -> tuple[Optional[ApiAccount], str, str]:
+    """
+    Resolves client model to (target_account, resp_model, inferred_mode).
+    - Fable 5.1 -> KIOS_FABLE_ACCT (glm-5.3), model preserved
+    - opus 5 -> KIOS_OPUS_ACCT (kilo-auto), model preserved, expert mode (reasoning)
+    """
+    if not model:
+        return None, MODEL_NAME, "default"
+    norm = model.strip().lower().replace("_", "-").replace(" ", "-")
+    if "fable" in norm:
+        return KIOS_FABLE_ACCT, model, "default"
+    if "opus" in norm:
+        return KIOS_OPUS_ACCT, model, "expert"
+    return None, _normalize_response_model(model), "default"
 
 
 def _load_api_keys() -> list[str]:
@@ -573,7 +613,7 @@ class AcquiredAccount:
         _UPSTREAM_LIMITER.release()
 
 
-def _acquire(cache_key: str | None = None, attempt: int = 0, allow_api: bool = True) -> AcquiredAccount:
+def _acquire(cache_key: str | None = None, attempt: int = 0, allow_api: bool = True, target_account: Optional[ApiAccount] = None) -> AcquiredAccount:
     # Global upstream concurrency cap (e.g. coding agents spawning parallel
     # sub-agents). Wait for a slot before grabbing a pool account so queued
     # requests don't hold accounts busy.
@@ -581,14 +621,27 @@ def _acquire(cache_key: str | None = None, attempt: int = 0, allow_api: bool = T
     try:
         cached = SESSION_CACHE.get(cache_key) if cache_key and attempt == 0 else None
         if cached and cached.account_id:
+            if target_account is not None and cached.account_id == target_account.id:
+                return AcquiredAccount(target_account, cache_key=cache_key)
+            if cached.account_id == "kios_fable" and KIOS_FABLE_ACCT is not None:
+                return AcquiredAccount(KIOS_FABLE_ACCT, cache_key=cache_key)
+            if cached.account_id == "kios_opus" and KIOS_OPUS_ACCT is not None:
+                return AcquiredAccount(KIOS_OPUS_ACCT, cache_key=cache_key)
             if cached.account_id == "upstream_api" and UPSTREAM_API_ACCT is not None and attempt == 0:
                 return AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
             if cached.account_id == "fallback_api" and FALLBACK_API_ACCT is not None:
                 return AcquiredAccount(FALLBACK_API_ACCT, cache_key=cache_key)
-            if cached.account_id not in ("upstream_api", "fallback_api"):
+            if cached.account_id not in ("upstream_api", "fallback_api", "kios_fable", "kios_opus"):
                 acct = pool.acquire_by_id(cached.account_id)
                 if acct is not None:
                     return AcquiredAccount(acct, cache_key=cache_key)
+
+        if target_account is not None:
+            if attempt == 0 or FALLBACK_API_ACCT is None:
+                return AcquiredAccount(target_account, cache_key=cache_key)
+            if attempt == 1 and FALLBACK_API_ACCT is not None:
+                log.info("target_account_failed_trying_fallback_api")
+                return AcquiredAccount(FALLBACK_API_ACCT, cache_key=cache_key)
 
         if allow_api and UPSTREAM_MODE == "api":
             if attempt == 0 and UPSTREAM_API_ACCT is not None:
@@ -624,11 +677,14 @@ def _acquire(cache_key: str | None = None, attempt: int = 0, allow_api: bool = T
     return AcquiredAccount(acct, cache_key=cache_key)
 
 
-def _acquire_safe(cache_key: str | None = None, attempt: int = 0) -> AcquiredAccount:
+def _acquire_safe(cache_key: str | None = None, attempt: int = 0, target_account: Optional[ApiAccount] = None) -> AcquiredAccount:
     try:
-        return _acquire(cache_key=cache_key, attempt=attempt)
+        return _acquire(cache_key=cache_key, attempt=attempt, target_account=target_account)
     except TypeError:
-        return _acquire(cache_key=cache_key)
+        try:
+            return _acquire(cache_key=cache_key, attempt=attempt)
+        except TypeError:
+            return _acquire(cache_key=cache_key)
 
 
 def _upstream_limit_from_env() -> int:
@@ -830,8 +886,12 @@ async def health():
 async def list_models(request: Request):
     _check_api_auth(request)
     rate_headers = _check_rate_limit(request)
-    # Surface every model declared in MODEL_ROUTES; fall back to MODEL_NAME.
-    names = MODEL_ROUTER.models or [MODEL_NAME]
+    # Surface public models: Fable 5.1, opus 5, and any from MODEL_ROUTES / MODEL_NAME
+    default_models = ["Fable 5.1", "fable-5.1", "opus 5", "opus-5"]
+    names = list(default_models)
+    for m in (MODEL_ROUTER.models or [MODEL_NAME, "gpt-6-astra-reasoner"]):
+        if m not in names:
+            names.append(m)
     return JSONResponse(
         ModelList(data=[
             ModelInfo(id=name, created=int(time.time())) for name in names
@@ -849,6 +909,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     api_tools = [t.model_dump() for t in req.tools] if req.tools else None
     prompt = _build_prompt(req.messages, req.tools, req.tool_choice)
 
+    # Resolve target account and response model (e.g. Fable 5.1 -> glm-5.3, opus 5 -> kilo-auto)
+    target_acct, resp_model, inferred_mode = _resolve_model_target(req.model)
+
     # Resolve model_type / thinking / search from MODEL_ROUTES first, then
     # MODE/THINKING/SEARCH env vars, then the per-request fields.
     decision = MODEL_ROUTER.route_for(req.model)
@@ -856,6 +919,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # MODE controls model_type (quick → "default", expert → "expert")
     if decision.matched_model:
         model_type = decision.model_type
+    elif inferred_mode == "expert":
+        model_type = "expert"
     elif MODE == "expert":
         model_type = "expert"
     else:
@@ -864,6 +929,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # THINKING controls thinking_enabled independent of mode
     if decision.thinking is not None:
         thinking = decision.thinking
+    elif inferred_mode == "expert" and (req.thinking_mode is not False):
+        thinking = True
     elif THINKING == "enabled":
         thinking = True
     elif THINKING == "disabled":
@@ -885,15 +952,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # streamed call from a non-streaming call (or vice versa) makes the
     # upstream return an empty response. Same-mode multi-turn still works.
     openai_user = _extract_openai_user(req, request)
-    resp_model = _normalize_response_model(req.model)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
                                     cache_key=_cache_key(request, "stream", openai_user), resp_model=resp_model,
-                                    api_messages=api_messages, api_tools=api_tools, tool_choice=req.tool_choice)
+                                    api_messages=api_messages, api_tools=api_tools, tool_choice=req.tool_choice,
+                                    target_account=target_acct)
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
                              cache_key=_cache_key(request, "nonstream", openai_user), resp_model=resp_model,
-                             api_messages=api_messages, api_tools=api_tools, tool_choice=req.tool_choice)
+                             api_messages=api_messages, api_tools=api_tools, tool_choice=req.tool_choice,
+                             target_account=target_acct)
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -919,6 +987,9 @@ async def messages(req: AnthropicRequest, request: Request):
     api_messages = anthropic_to_openai_messages(req.messages, system=req.system)
     api_tools = anthropic_to_openai_tools(req.tools)
 
+    # Resolve target account and response model (e.g. Fable 5.1 -> glm-5.3, opus 5 -> kilo-auto)
+    target_acct, resp_model, inferred_mode = _resolve_model_target(req.model)
+
     # Resolve model_type / thinking / search from MODEL_ROUTES first, then
     # MODE/THINKING/SEARCH env vars, then the per-request fields.
     decision = MODEL_ROUTER.route_for(req.model)
@@ -926,6 +997,8 @@ async def messages(req: AnthropicRequest, request: Request):
     # MODE controls model_type
     if decision.matched_model:
         model_type = decision.model_type
+    elif inferred_mode == "expert":
+        model_type = "expert"
     elif MODE == "expert":
         model_type = "expert"
     else:
@@ -934,6 +1007,8 @@ async def messages(req: AnthropicRequest, request: Request):
     # THINKING — Anthropic thinking param maps to thinking_mode
     if decision.thinking is not None:
         thinking = decision.thinking
+    elif inferred_mode == "expert" and (req.thinking is None or getattr(req.thinking, "type", "") != "disabled"):
+        thinking = True
     elif THINKING == "enabled":
         thinking = True
     elif THINKING == "disabled":
@@ -964,28 +1039,37 @@ async def messages(req: AnthropicRequest, request: Request):
                                        search_enabled=search,
                                        rate_headers=rate_headers,
                                        cache_key=_cache_key(request, "stream", anth_user),
+                                       resp_model=resp_model,
                                        api_messages=api_messages,
-                                       api_tools=api_tools)
+                                       api_tools=api_tools,
+                                       target_account=target_acct)
 
     return _anthropic_nonstream(proxy_id, prompt, tool_names,
                                 model_type=model_type, thinking_mode=thinking,
                                 search_enabled=search,
                                 cache_key=_cache_key(request, "nonstream", anth_user),
+                                resp_model=resp_model,
                                 api_messages=api_messages,
-                                api_tools=api_tools)
+                                api_tools=api_tools,
+                                target_account=target_acct)
 
 
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False,
                          cache_key: str | None = None,
+                         resp_model: str = MODEL_NAME,
                          api_messages: list[dict] | None = None,
-                         api_tools: list[dict] | None = None):
-    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
+                         api_tools: list[dict] | None = None,
+                         target_account: Optional[ApiAccount] = None):
+    max_tries = max(2 if (FALLBACK_API_ACCT is not None or target_account is not None) else 1, pool.count())
     content = ""
     thinking = None
     for attempt in range(max_tries):
-        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
+        if target_account is not None:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt, target_account=target_account)
+        else:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
             t0 = time.time()
@@ -1020,7 +1104,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("anthropic_nonstream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1031,7 +1115,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         except UpstreamHintError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("anthropic_nonstream_hint_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1040,7 +1124,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("anthropic_nonstream_empty_failover", extra={"attempt": attempt})
                 continue
@@ -1048,7 +1132,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("anthropic_nonstream_error_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1057,9 +1141,10 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             if acq:
                 acq.release()
     else:
-        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+        fallback_acct = target_account or UPSTREAM_API_ACCT
+        if fallback_acct is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
-            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            acq = AcquiredAccount(fallback_acct, cache_key=cache_key)
             try:
                 ds_id = acq.create_session()
                 t0 = time.time()
@@ -1092,7 +1177,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
     else:
         tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
     return build_nonstream_response(
-        msg_id, MODEL_NAME,
+        msg_id, resp_model,
         content_text=cleaned or content,
         tool_calls=tool_calls,
         thinking_text=thinking,
@@ -1104,16 +1189,21 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             thinking_mode: bool = False, search_enabled: bool = False,
                             rate_headers: dict | None = None,
                             cache_key: str | None = None,
+                            resp_model: str = MODEL_NAME,
                             api_messages: list[dict] | None = None,
-                            api_tools: list[dict] | None = None):
-    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
+                            api_tools: list[dict] | None = None,
+                            target_account: Optional[ApiAccount] = None):
+    max_tries = max(2 if (FALLBACK_API_ACCT is not None or target_account is not None) else 1, pool.count())
     acq = None
     stream_gen = None
     ready_out: dict = {}
     first_token = None
 
     for attempt in range(max_tries):
-        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
+        if target_account is not None:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt, target_account=target_account)
+        else:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
             ready_out = {}
@@ -1157,7 +1247,7 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             if acq:
                 acq.release()
                 acq = None
-            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and is_api and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("anthropic_stream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1172,15 +1262,16 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                 _mark_error_safe(acq.acct, str(e))
                 acq.release()
                 acq = None
-            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and is_api and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("anthropic_stream_error_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
             raise
     else:
-        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+        fallback_acct = target_account or UPSTREAM_API_ACCT
+        if fallback_acct is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
-            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            acq = AcquiredAccount(fallback_acct, cache_key=cache_key)
             ds_id = acq.create_session()
             if getattr(acq.acct, "is_api", False):
                 stream_gen = acq.adapter.chat_stream(
@@ -1219,7 +1310,7 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
         nonlocal t0
         try:
             for event in stream_response(
-                msg_id, MODEL_NAME,
+                msg_id, resp_model,
                 _token_source(),
                 tool_names,
                 thinking_mode=thinking_mode,
@@ -1266,15 +1357,19 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
                       resp_model: str = MODEL_NAME,
                       api_messages: list[dict] | None = None,
                       api_tools: list[dict] | None = None,
-                      tool_choice: Any = None):
+                      tool_choice: Any = None,
+                      target_account: Optional[ApiAccount] = None):
     """Non-streaming completion with tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
-    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
+    max_tries = max(2 if (FALLBACK_API_ACCT is not None or target_account is not None) else 1, pool.count())
     content = ""
     thinking = None
     ready_out: dict = {}
     for attempt in range(max_tries):
-        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
+        if target_account is not None:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt, target_account=target_account)
+        else:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
             t0 = time.time()
@@ -1312,7 +1407,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("openai_nonstream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1320,7 +1415,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         except UpstreamHintError as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("openai_nonstream_hint_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1329,7 +1424,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             get_stats().record(MODEL_NAME, 0, success=False)
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("openai_nonstream_empty_failover", extra={"attempt": attempt})
                 continue
@@ -1337,7 +1432,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         except Exception as e:
             get_stats().record(MODEL_NAME, 0, success=False)
             _mark_error_safe(acq.acct, str(e))
-            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and getattr(acq.acct, "is_api", False) and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("openai_nonstream_error_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1346,9 +1441,10 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             if acq:
                 acq.release()
     else:
-        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+        fallback_acct = target_account or UPSTREAM_API_ACCT
+        if fallback_acct is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
-            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            acq = AcquiredAccount(fallback_acct, cache_key=cache_key)
             try:
                 ds_id = acq.create_session()
                 t0 = time.time()
@@ -1456,17 +1552,21 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          resp_model: str = MODEL_NAME,
                          api_messages: list[dict] | None = None,
                          api_tools: list[dict] | None = None,
-                         tool_choice: Any = None):
+                         tool_choice: Any = None,
+                         target_account: Optional[ApiAccount] = None):
     """Streaming completion with StreamSieve tool call detection and automatic failover."""
     prompt_tokens = count_text(prompt)
-    max_tries = max(2 if FALLBACK_API_ACCT is not None else 1, pool.count())
+    max_tries = max(2 if (FALLBACK_API_ACCT is not None or target_account is not None) else 1, pool.count())
     acq = None
     stream_iter = None
     ready_out: dict = {}
     first_token = None
 
     for attempt in range(max_tries):
-        acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
+        if target_account is not None:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt, target_account=target_account)
+        else:
+            acq = _acquire_safe(cache_key=cache_key if attempt == 0 else None, attempt=attempt)
         try:
             ds_id = acq.create_session()
             ready_out = {}
@@ -1511,7 +1611,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             if acq:
                 acq.release()
                 acq = None
-            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and is_api and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("openai_stream_ratelimit_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
@@ -1526,15 +1626,16 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 _mark_error_safe(acq.acct, str(e))
                 acq.release()
                 acq = None
-            can_retry = (attempt == 0 and is_api and FALLBACK_API_ACCT is not None)
+            can_retry = (attempt == 0 and is_api and (FALLBACK_API_ACCT is not None or target_account is not None))
             if can_retry:
                 log.warning("openai_stream_error_failover", extra={"attempt": attempt, "error": str(e)})
                 continue
             raise
     else:
-        if UPSTREAM_API_URL and UPSTREAM_API_ACCT is not None:
+        fallback_acct = target_account or UPSTREAM_API_ACCT
+        if fallback_acct is not None:
             log.warning("pool_accounts_exhausted_fallback_to_upstream_api")
-            acq = AcquiredAccount(UPSTREAM_API_ACCT, cache_key=cache_key)
+            acq = AcquiredAccount(fallback_acct, cache_key=cache_key)
             ds_id = acq.create_session()
             if getattr(acq.acct, "is_api", False):
                 stream_iter = acq.adapter.chat_stream(

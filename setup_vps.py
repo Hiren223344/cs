@@ -72,6 +72,12 @@ FALLBACK_API_URL=https://api.apinex.bond/v1
 FALLBACK_API_KEY=sk-apx1fb620e3fd93bb3af2557b37fbfe51805fa5017880b0b48
 FALLBACK_MODEL=free/muse-spark-1.3
 
+# Kios API Provider (Routes Fable 5.1 -> glm-5.3, opus 5 -> kilo-auto)
+KIOS_API_URL=https://router.kiosapi.com/v1
+KIOS_API_KEY=sk-ZD5ElGHGHqXdVc8KWnOKdbwhiFORVpx2XHxOIslap9AI8Mzi
+KIOS_FABLE_MODEL=glm-5.3
+KIOS_OPUS_MODEL=kilo-auto
+
 # Network Bind & Port
 HOST=0.0.0.0
 PORT=8000

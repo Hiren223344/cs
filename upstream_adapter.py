@@ -75,6 +75,48 @@ def _prompt_to_messages(prompt: str) -> list[dict]:
     return merged
 
 
+def _parse_sse_response_to_chat(text: str) -> Tuple[str, Optional[str], list[dict]]:
+    """Parse an SSE formatted text into (content, thinking, tool_calls)."""
+    content_parts = []
+    thinking_parts = []
+    tool_calls_dict: dict[int, dict] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data: ") and line != "data: [DONE]":
+            try:
+                chunk = json.loads(line[6:].strip())
+                choices = chunk.get("choices", [])
+                if not choices or not isinstance(choices[0], dict):
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                r = delta.get("reasoning_content") or delta.get("reasoning")
+                if r:
+                    thinking_parts.append(r)
+                if delta.get("tool_calls"):
+                    for tc in delta["tool_calls"]:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {
+                                "id": tc.get("id", f"call_{secrets.token_hex(8)}"),
+                                "type": tc.get("type", "function"),
+                                "function": {
+                                    "name": tc.get("function", {}).get("name", ""),
+                                    "arguments": tc.get("function", {}).get("arguments", ""),
+                                }
+                            }
+                        else:
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_dict[idx]["function"]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                tool_calls_dict[idx]["function"]["arguments"] += fn["arguments"]
+            except Exception:
+                pass
+    return "".join(content_parts), ("".join(thinking_parts) or None), list(tool_calls_dict.values())
+
+
 class OpenAIUpstreamAdapter:
     """Adapter for an OpenAI-compatible upstream API."""
 
@@ -142,12 +184,16 @@ class OpenAIUpstreamAdapter:
             if resp.status_code in (429, 402):
                 raise RateLimitError(f"Upstream rate limit ({resp.status_code}): {err_body}") from e
             raise RuntimeError(f"Upstream HTTP {resp.status_code}: {err_body}") from e
-        data = resp.json()
-        choice = data.get("choices", [{}])[0]
-        msg = choice.get("message", {})
-        content = msg.get("content") or ""
-        thinking = msg.get("reasoning_content") or None
-        tcs = msg.get("tool_calls") or []
+        raw_text = getattr(resp, "text", "")
+        if raw_text and (raw_text.strip().startswith("data: ") or getattr(resp, "headers", {}).get("content-type", "").startswith("text/event-stream")):
+            content, thinking, tcs = _parse_sse_response_to_chat(raw_text)
+        else:
+            data = resp.json()
+            choice = data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            content = msg.get("content") or ""
+            thinking = msg.get("reasoning_content") or msg.get("reasoning") or None
+            tcs = msg.get("tool_calls") or []
 
         if ready_out is not None:
             ready_out["response_message_id"] = 1
@@ -215,13 +261,13 @@ class OpenAIUpstreamAdapter:
                 try:
                     chunk = json.loads(raw)
                     choices = chunk.get("choices", [])
-                    if not choices:
+                    if not choices or not isinstance(choices[0], dict):
                         continue
-                    delta = choices[0].get("delta", {})
+                    delta = choices[0].get("delta", {}) or {}
                     tcs = delta.get("tool_calls")
                     if tcs:
                         yield {"__type": "tool_calls", "tool_calls": tcs}
-                    reasoning = delta.get("reasoning_content")
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if reasoning:
                         yield {"__type": "thinking", "content": reasoning}
                     text = delta.get("content")

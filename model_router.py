@@ -118,6 +118,10 @@ class ModelRouter:
             route = self._routes.get("gpt-6-astra") or self._routes.get(os.environ.get("MODEL_NAME", "gpt-6-astra"))
         if route is None and model == "deepseek-reasoner":
             route = self._routes.get("gpt-6-astra-reasoner") or _Route(model_type="expert")
+        if route is None and model in ("Fable 5.1", "fable-5.1"):
+            route = _Route(model_type="default")
+        if route is None and model in ("opus 5", "opus-5"):
+            route = _Route(model_type="expert", thinking=True)
         if route is None:
             return RouteDecision()
         return RouteDecision(
